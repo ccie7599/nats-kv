@@ -6,3 +6,8 @@ target/
 node_modules/
 .env
 *.log
+
+# Never commit secrets — bootstrap creds via Vault or kubectl apply outside git
+**/*pull-secret*.yaml
+**/*-creds.yaml
+**/secrets/**
