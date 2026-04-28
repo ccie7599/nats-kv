@@ -1,0 +1,20 @@
+#:schema https://schemas.spinframework.dev/spin/manifest-v2/latest.json
+
+spin_manifest_version = 2
+
+[application]
+name = "nats-kv-user"
+version = "0.1.0"
+authors = ["ccie7599 <brian@apley.net>"]
+description = "NATS KV demo UI"
+
+[[trigger.http]]
+route = "/..."
+component = "nats-kv-user"
+
+[component.nats-kv-user]
+source = "target/wasm32-wasip1/release/nats_kv_user.wasm"
+allowed_outbound_hosts = ["http://*.connected-cloud.io:8080", "http://*.connected-cloud.io"]
+[component.nats-kv-user.build]
+command = "cargo build --target wasm32-wasip1 --release"
+watch = ["src/**/*.rs", "Cargo.toml"]

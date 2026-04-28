@@ -1,0 +1,35 @@
+#cloud-config
+package_update: true
+packages:
+  - curl
+
+write_files:
+  - path: /etc/systemd/system/kv-adapter.service
+    content: |
+      [Unit]
+      Description=NATS KV Adapter
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      Environment=REGION=REGION_PLACEHOLDER
+      Environment=LISTEN_ADDR=:8080
+      Environment=DEMO_TOKEN=${demo_token}
+      Environment=JETSTREAM_DIR=/var/lib/nats/jetstream
+      ExecStart=/usr/local/bin/kv-adapter
+      Restart=always
+      RestartSec=5
+      LimitNOFILE=65536
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - mkdir -p /var/lib/nats/jetstream
+  - curl -fsSL -o /usr/local/bin/kv-adapter ${binary_url}
+  - chmod +x /usr/local/bin/kv-adapter
+  - systemctl daemon-reload
+  - systemctl enable --now kv-adapter
+  - ufw allow 22/tcp || true
+  - ufw allow 8080/tcp || true

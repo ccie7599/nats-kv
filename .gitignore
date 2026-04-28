@@ -1,0 +1,8 @@
+bin/
+target/
+.terraform/
+*.tfstate*
+.spin/
+node_modules/
+.env
+*.log
