@@ -1,0 +1,23 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: nats-kv
+  namespace: argocd
+  annotations:
+    project: nats-kv
+    owner: brian
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:ccie7599/nats-kv.git
+    targetRevision: main
+    path: k8s
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: demo-nats-kv
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: kv-adapter
+  namespace: demo-nats-kv
+spec:
+  type: ClusterIP
+  selector:
+    app: kv-adapter
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: nats-client
+      port: 4222
+      targetPort: 4222
+    - name: nats-monitor
+      port: 8222
+      targetPort: 8222
+---
+# External LoadBalancer (NodeBalancer) for the v0.2 demo.
+# Per CLAUDE.md hostNetwork+hostPort is preferred for primary data plane;
+# we'll switch when we expand to multi-region (each leaf cluster is single-node, so
+# hostNetwork is the natural pattern then). For now NB is the fastest path to a
+# stable public endpoint with TLS in front (handled separately by Akamai property).
+apiVersion: v1
+kind: Service
+metadata:
+  name: kv-adapter-external
+  namespace: demo-nats-kv
+  annotations:
+    service.beta.kubernetes.io/linode-loadbalancer-throttle: "0"
+    service.beta.kubernetes.io/linode-loadbalancer-firewall-id: "3900446"  # demo-nb-fw
+spec:
+  type: LoadBalancer
+  selector:
+    app: kv-adapter
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP

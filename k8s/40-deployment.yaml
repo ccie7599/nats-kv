@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kv-adapter
+  namespace: demo-nats-kv
+  labels:
+    app: kv-adapter
+    project: nats-kv
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate    # JetStream requires single writer to PVC
+  selector:
+    matchLabels:
+      app: kv-adapter
+  template:
+    metadata:
+      labels:
+        app: kv-adapter
+        project: nats-kv
+      annotations:
+        # OTel pipeline picks /metrics off this pod and ships through gateway → Prometheus
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8222"
+        prometheus.io/path: "/varz"
+        # Vault Agent injector — renders /vault/secrets/demo-token from api/nats-kv/config
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "api"
+        vault.hashicorp.com/agent-inject-secret-demo-token: "api/data/nats-kv/config"
+        vault.hashicorp.com/agent-inject-template-demo-token: |
+          {{- with secret "api/data/nats-kv/config" -}}
+          {{ .Data.data.demo_token }}
+          {{- end -}}
+    spec:
+      serviceAccountName: app-vault-access
+      imagePullSecrets:
+        - name: harbor-creds
+      # Read DEMO_TOKEN from Vault-injected file at startup
+      containers:
+        - name: adapter
+          image: harbor.harbor.svc.cluster.local/presales/nats-kv-adapter:v0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export DEMO_TOKEN="$(cat /vault/secrets/demo-token)"
+              exec /usr/local/bin/kv-adapter
+          env:
+            - name: REGION
+              value: "us-ord"
+            - name: LISTEN_ADDR
+              value: ":8080"
+            - name: JETSTREAM_DIR
+              value: "/var/lib/nats/jetstream"
+            - name: NATS_CLIENT_PORT
+              value: "4222"
+            - name: NATS_CLUSTER_PORT
+              value: "6222"
+            - name: NATS_MONITOR_PORT
+              value: "8222"
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: nats-client
+              containerPort: 4222
+            - name: nats-monitor
+              containerPort: 8222
+          readinessProbe:
+            httpGet:
+              path: /v1/health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /v1/health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1500m
+              memory: 1Gi
+          volumeMounts:
+            - name: jetstream
+              mountPath: /var/lib/nats/jetstream
+      volumes:
+        - name: jetstream
+          persistentVolumeClaim:
+            claimName: jetstream-data

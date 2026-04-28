@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-nats-kv
+  labels:
+    project: nats-kv
+    tier: demo

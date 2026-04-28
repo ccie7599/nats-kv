@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jetstream-data
+  namespace: demo-nats-kv
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: linode-block-storage-retain
+  resources:
+    requests:
+      storage: 50Gi
