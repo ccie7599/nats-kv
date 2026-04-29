@@ -28,7 +28,7 @@ spec:
         - key: tier
           operator: Equal
           value: kv
-          effect: NoSchedule
+          effect: NoExecute
       imagePullSecrets:
         - name: harbor-creds
       containers:
@@ -45,7 +45,7 @@ spec:
             - name: LISTEN_ADDR
               value: ":8080"
             - name: LISTEN_TLS_ADDR
-              value: ":8443"
+              value: ":443"
             - name: TLS_CERT_FILE
               value: "/etc/tls/tls.crt"
             - name: TLS_KEY_FILE
@@ -62,7 +62,7 @@ spec:
               value: "nats-route://us-ord.nats-kv.connected-cloud.io:6222"
           ports:
             - { name: http,         containerPort: 8080, hostPort: 8080 }
-            - { name: https,        containerPort: 8443, hostPort: 443 }
+            - { name: https,        containerPort: 443,  hostPort: 443 }
             - { name: nats-client,  containerPort: 4222, hostPort: 4222 }
             - { name: nats-cluster, containerPort: 6222, hostPort: 6222 }
             - { name: nats-monitor, containerPort: 8222, hostPort: 8222 }
