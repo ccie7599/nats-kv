@@ -18,6 +18,9 @@ import (
 
 func main() {
 	listen := envOr("LISTEN_ADDR", ":8088")
+	listenTLS := envOr("LISTEN_TLS_ADDR", "")
+	tlsCert := envOr("TLS_CERT_FILE", "")
+	tlsKey := envOr("TLS_KEY_FILE", "")
 	natsURL := envOr("NATS_URL", "nats://kv-adapter.demo-nats-kv.svc.cluster.local:4222")
 	dbPath := envOr("DB_PATH", "/var/lib/nats-kv-control/control.db")
 	adminToken := os.Getenv("ADMIN_TOKEN")
@@ -72,6 +75,21 @@ func main() {
 		}
 	}()
 
+	var tlsSrv *http.Server
+	if listenTLS != "" && tlsCert != "" && tlsKey != "" {
+		tlsSrv = &http.Server{
+			Addr:              listenTLS,
+			Handler:           srv.Handler(),
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		go func() {
+			log.Printf("https listening on %s (cert=%s)", listenTLS, tlsCert)
+			if err := tlsSrv.ListenAndServeTLS(tlsCert, tlsKey); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("https: %v", err)
+			}
+		}()
+	}
+
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
@@ -79,6 +97,9 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(ctx)
+	if tlsSrv != nil {
+		_ = tlsSrv.Shutdown(ctx)
+	}
 }
 
 func envOr(k, d string) string {

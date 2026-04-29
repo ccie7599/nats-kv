@@ -40,7 +40,7 @@ spec:
         - name: harbor-creds
       containers:
         - name: control
-          image: harbor.harbor.svc.cluster.local/presales/nats-kv-control:v0.1.0
+          image: harbor.harbor.svc.cluster.local/presales/nats-kv-control:v0.1.1
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -49,11 +49,15 @@ spec:
               exec /usr/local/bin/kv-control
           env:
             - { name: LISTEN_ADDR,     value: ":8088" }
+            - { name: LISTEN_TLS_ADDR, value: ":8443" }
+            - { name: TLS_CERT_FILE,   value: "/etc/tls/tls.crt" }
+            - { name: TLS_KEY_FILE,    value: "/etc/tls/tls.key" }
             - { name: NATS_URL,        value: "nats://kv-adapter.demo-nats-kv.svc.cluster.local:4222" }
             - { name: DB_PATH,         value: "/var/lib/nats-kv-control/control.db" }
             - { name: PUBLIC_BASE_URL, value: "https://nats-kv-demo.connected-cloud.io" }
           ports:
-            - { name: http, containerPort: 8088 }
+            - { name: http,  containerPort: 8088 }
+            - { name: https, containerPort: 8443 }
           readinessProbe:
             httpGet: { path: /v1/health, port: 8088 }
             initialDelaySeconds: 5
@@ -67,10 +71,14 @@ spec:
             limits:   { cpu: 500m, memory: 512Mi }
           volumeMounts:
             - { name: data, mountPath: /var/lib/nats-kv-control }
+            - { name: tls,  mountPath: /etc/tls, readOnly: true }
       volumes:
         - name: data
           persistentVolumeClaim:
             claimName: control-data
+        - name: tls
+          secret:
+            secretName: nats-kv-tls
 ---
 apiVersion: v1
 kind: Service
@@ -94,4 +102,4 @@ spec:
   type: LoadBalancer
   selector: { app: kv-control }
   ports:
-    - { name: https, port: 443, targetPort: 8088, protocol: TCP }
+    - { name: https, port: 443, targetPort: 8443, protocol: TCP }

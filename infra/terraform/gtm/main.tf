@@ -94,7 +94,7 @@ resource "akamai_gtm_property" "kv" {
     http_error3xx                    = true
     http_error4xx                    = true
     http_error5xx                    = true
-    peer_certificate_verification    = true
+    peer_certificate_verification    = false  # GTM probe can't supply per-DC SNI; cert validity is enforced at the client tier
     disable_nonstandard_port_warning = false
   }
 
