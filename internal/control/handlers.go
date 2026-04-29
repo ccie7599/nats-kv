@@ -168,15 +168,22 @@ var allRegions = []string{
 func (s *Server) userBucketsHandler(w http.ResponseWriter, r *http.Request, t *tenant.Tenant) {
 	switch r.Method {
 	case http.MethodGet:
-		// List buckets owned by this tenant.
-		out := []string{}
+		// List buckets owned by this tenant, enriched with per-bucket details
+		// (replicas, leader, placement tags, mirror count). The dashboard uses
+		// this single round trip — earlier two-call design (names from here +
+		// admin/buckets via adapter) failed when the adapter response (~50KB
+		// across all buckets) tripped Spin's body framing through FWF.
 		prefix := t.ID + "__"
+		names := []string{}
+		details := []map[string]any{}
 		for name := range s.js.KeyValueStoreNames() {
-			if strings.HasPrefix(name, prefix) {
-				out = append(out, name)
+			if !strings.HasPrefix(name, prefix) {
+				continue
 			}
+			names = append(names, name)
+			details = append(details, s.bucketDetails(name))
 		}
-		writeJSON(w, 200, map[string]any{"buckets": out, "tenant_id": t.ID})
+		writeJSON(w, 200, map[string]any{"buckets": names, "details": details, "tenant_id": t.ID})
 	case http.MethodPost:
 		s.createUserBucket(w, r, t)
 	default:
@@ -352,6 +359,45 @@ func (s *Server) resolvePlacement(ctx context.Context, req *createBucketReq) (*p
 	}
 	d.AnchorSource = anchorSrc
 	return d, nil
+}
+
+// bucketDetails returns per-bucket info for the dashboard list (replicas,
+// leader, placement tags, mirror count). Lifted from the adapter's
+// bucketSummary but kept lean — we don't need state size or per-mirror lag
+// here; the topology page covers that.
+func (s *Server) bucketDetails(name string) map[string]any {
+	out := map[string]any{"name": name}
+	streamName := "KV_" + name
+	si, err := s.js.StreamInfo(streamName)
+	if err != nil || si == nil {
+		out["error"] = "stream-info: bucket missing or unreachable"
+		return out
+	}
+	out["replicas"] = si.Config.Replicas
+	if si.Config.Placement != nil {
+		out["placement_tags"] = si.Config.Placement.Tags
+	}
+	if si.Cluster != nil {
+		peers := []map[string]any{{"name": si.Cluster.Leader, "role": "leader"}}
+		for _, p := range si.Cluster.Replicas {
+			peers = append(peers, map[string]any{
+				"name":    p.Name,
+				"role":    "replica",
+				"current": p.Current,
+				"lag_ms":  p.Lag,
+			})
+		}
+		out["peers"] = peers
+		out["leader"] = si.Cluster.Leader
+	}
+	mirrorCount := 0
+	for sn := range s.js.StreamNames() {
+		if strings.HasPrefix(sn, streamName+"_mirror_") {
+			mirrorCount++
+		}
+	}
+	out["mirror_count"] = mirrorCount
+	return out
 }
 
 // streamRegions returns the set of region IDs that already host a replica

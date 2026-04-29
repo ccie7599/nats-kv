@@ -639,19 +639,22 @@ async function createBucket() {
   loadBuckets();
 }
 async function loadBuckets() {
-  const lr = await authedFetch("/api/control/v1/me/buckets", { headers: {"Authorization": "Bearer " + userKey()} });
-  const lj = await lr.json();
-  const names = new Set(lj.buckets || []);
-  const r = await authedFetch("/api/nats/v1/admin/buckets");
+  const r = await authedFetch("/api/control/v1/me/buckets", { headers: {"Authorization": "Bearer " + userKey()} });
   const j = await r.json();
-  let payload;
-  try { payload = JSON.parse(atob(j.body_b64 || "")); } catch (e) { payload = j; }
-  const mine = (payload.buckets || []).filter(b => names.has(b.name));
   const tb = document.getElementById("b-tbl").querySelector("tbody");
-  tb.innerHTML = mine.map(b => {
-    const peers = (b.peers||[]).map(p => p.name.replace('kv-','')).join(', ');
-    return `<tr><td style="padding:6px;border-bottom:1px solid #30363d">${b.name}</td><td style="text-align:center;padding:6px;border-bottom:1px solid #30363d">R${b.replicas}</td><td class="meta" style="padding:6px;border-bottom:1px solid #30363d">${peers}</td><td style="text-align:center;padding:6px;border-bottom:1px solid #30363d">${(b.mirrors||[]).length}</td></tr>`;
-  }).join("") || '<tr><td colspan="4" class="meta">(no buckets yet — create one above)</td></tr>';
+  if (!r.ok) {
+    tb.innerHTML = `<tr><td colspan="4" class="err">${j.error||r.status}</td></tr>`;
+    return;
+  }
+  const details = j.details || [];
+  if (details.length === 0) {
+    tb.innerHTML = '<tr><td colspan="4" class="meta">(no buckets yet — create one above)</td></tr>';
+    return;
+  }
+  tb.innerHTML = details.map(b => {
+    const peers = (b.peers||[]).map(p => p.name.replace('kv-','')).join(', ') || (b.leader||'').replace('kv-','');
+    return `<tr><td style="padding:6px;border-bottom:1px solid #30363d">${b.name}</td><td style="text-align:center;padding:6px;border-bottom:1px solid #30363d">R${b.replicas||'?'}</td><td class="meta" style="padding:6px;border-bottom:1px solid #30363d">${peers}</td><td style="text-align:center;padding:6px;border-bottom:1px solid #30363d">${b.mirror_count||0}</td></tr>`;
+  }).join("");
 }
 </script>
 </body></html>
