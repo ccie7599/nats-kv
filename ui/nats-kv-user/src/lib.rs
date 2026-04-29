@@ -1,14 +1,89 @@
 use spin_sdk::http::{IntoResponse, Method, Request, Response};
 use spin_sdk::http_component;
 use spin_sdk::key_value::Store;
+use spin_sdk::variables;
 
 const ADAPTER_BASE: &str = "http://edge.nats-kv.connected-cloud.io:8080";
 const CONTROL_BASE: &str = "https://cp.nats-kv.connected-cloud.io";
 const FALLBACK_TOKEN: &str = "akv_demo_open"; // used by playground if user not signed in
+const UI_COOKIE: &str = "nats-kv-ui-access";
+
+fn ui_gate_token() -> String {
+    variables::get("ui_gate_token").unwrap_or_else(|_| "demo-open-2026".to_string())
+}
+
+// True if the request carries a valid UI gate cookie OR a valid `?access=` query.
+// Whitelisted paths bypass this entirely (see is_public_path).
+fn is_ui_authed(req: &Request) -> bool {
+    let want = ui_gate_token();
+    // Cookie path
+    if let Some(cookie_hdr) = req.header("cookie").and_then(|v| v.as_str()) {
+        for kv in cookie_hdr.split(';') {
+            let p = kv.trim();
+            if let Some(rest) = p.strip_prefix(&format!("{UI_COOKIE}=")) {
+                if rest == want { return true; }
+            }
+        }
+    }
+    // Query string path
+    let q = req.query();
+    for pair in q.split('&') {
+        if let Some(v) = pair.strip_prefix("access=") {
+            if v == want { return true; }
+        }
+    }
+    false
+}
+
+// Paths that don't require the UI gate. Everything else does.
+fn is_public_path(path: &str) -> bool {
+    matches!(path,
+        "/health" | "/api/request-invite"
+    )
+    || path.starts_with("/claim/")           // existing claim flow stays open
+    || path.starts_with("/static/")          // future static assets
+}
+
+// HTML page shown when an unauthed visitor lands. They can either request
+// an invite (queued for the admin to grant) or paste an access token.
+fn render_gate_page() -> anyhow::Result<Response> {
+    html(GATE_HTML)
+}
+
+// Build a 302 to the same path minus `?access=...`, with a Set-Cookie that
+// remembers the gate so subsequent navigation doesn't need the query string.
+fn redirect_with_cookie(path_no_query: &str) -> anyhow::Result<Response> {
+    let token = ui_gate_token();
+    // 14 days; HttpOnly so JS can't read it; SameSite=Lax to allow nav.
+    let cookie = format!("{UI_COOKIE}={token}; Path=/; Max-Age=1209600; HttpOnly; SameSite=Lax; Secure");
+    Ok(Response::builder()
+        .status(302)
+        .header("location", path_no_query)
+        .header("set-cookie", cookie)
+        .body(Vec::<u8>::new())
+        .build())
+}
 
 #[http_component]
 async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
     let path = req.path();
+
+    // ---- UI gate ----
+    // If the request is unauthed AND not on a public path, either capture the
+    // ?access= token (set cookie + 302 to clean URL) or show the gate page.
+    if !is_public_path(path) && !is_ui_authed(&req) {
+        return render_gate_page();
+    }
+    // If they came in with ?access=... and are now authed, drop the query param
+    // from the visible URL by setting the cookie + redirecting to the bare path.
+    if !is_public_path(path) && req.query().contains("access=") {
+        return redirect_with_cookie(path);
+    }
+
+    // POST /api/request-invite — visitor submits name + email, queued for admin.
+    if path == "/api/request-invite" && req.method() == &Method::Post {
+        return forward_invite_request(&req).await;
+    }
 
     // Static pages
     if path == "/" || path == "/index.html" {
@@ -220,6 +295,26 @@ async fn call_nats(method: Method, path: &str, body: &[u8], token: &str) -> anyh
         .status(200)
         .header("content-type", "application/json")
         .body(payload)
+        .build())
+}
+
+// Forward the visitor's invite request body to the control plane's open
+// /v1/internal/invite-requests endpoint. Body is whatever the page POSTed
+// (we trust the control plane to validate name/email shape).
+async fn forward_invite_request(req: &Request) -> anyhow::Result<Response> {
+    let body = req.body();
+    let url = format!("{CONTROL_BASE}/v1/internal/invite-requests");
+    let mut b = Request::builder();
+    b.method(Method::Post);
+    b.uri(url);
+    b.header("Content-Type", "application/json");
+    b.body(body.to_vec());
+    let upstream: Response = spin_sdk::http::send(b.build()).await?;
+    let status = *upstream.status() as u16;
+    Ok(Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(upstream.body().to_vec())
         .build())
 }
 
@@ -2545,6 +2640,97 @@ async function runVerify() {
 $("vfy-rows").innerHTML = TESTS.map((t, i) =>
   `<tr id="vfy-row-${i}"><td>${t.name}</td><td class="status idle">—</td><td class="detail"></td><td class="lat"></td></tr>`
 ).join("");
+</script>
+</body></html>
+"##;
+
+// =====================================================================
+// GATE_HTML — shown to any visitor without a valid UI gate cookie / token.
+// They can either request an invite (queued for admin to grant) or paste
+// an `?access=<token>` URL given to them by the admin.
+// Note: we don't reuse the shared nav here — the gate is the *only* page
+// unauthed visitors ever see.
+// =====================================================================
+const GATE_HTML: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>NATS-KV — request access</title><style>__SHARED_CSS__
+  body { max-width:680px; }
+  .hero { padding:24px; border:1px solid #30363d; border-radius:6px; background:#161b22; margin:24px 0; }
+  .hero h1 { margin:0 0 8px; }
+  .hero p { color:#8b949e; }
+  .twocol { display:grid; grid-template-columns:1fr; gap:16px; }
+  fieldset { padding:16px; }
+  textarea { min-height:60px; }
+  #out { margin-top:12px; padding:10px; border-radius:4px; font-size:13px; display:none; }
+  #out.ok { background:#0e2a17; border:1px solid #3fb950; color:#3fb950; display:block; }
+  #out.err { background:#3a1414; border:1px solid #f85149; color:#f85149; display:block; }
+</style></head><body>
+<div class="hero">
+  <h1>NATS-KV for Akamai Functions</h1>
+  <p>Demo-grade research POC: a globally distributed NATS JetStream KV exposed as an HTTP API for Spin functions. Atomic increment, revision history, CAS, subject-pattern wildcards, geo-pinned RAFT placement, mirrors-everywhere reads.</p>
+  <p style="margin-top:8px">This is a private demo. Request an invite below — Brian will share an access link once approved.</p>
+</div>
+
+<div class="twocol">
+  <fieldset>
+    <legend>Request an invite</legend>
+    <div class="row">
+      <div><label>name</label><input id="rq-name" placeholder="Jane Smith"></div>
+      <div><label>email</label><input id="rq-email" placeholder="jane@example.com"></div>
+    </div>
+    <div><label>what do you want to try? (optional)</label><textarea id="rq-reason" placeholder="What you're hoping to evaluate, what kind of workload, etc."></textarea></div>
+    <div class="actions" style="margin-top:8px"><button onclick="submitRequest()">Submit request</button></div>
+    <div id="out"></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Already have an access link?</legend>
+    <p class="meta" style="margin:0 0 8px">Paste the token from the URL Brian sent you (the part after <code>?access=</code>) or just click the link directly.</p>
+    <div class="row">
+      <div><label>access token</label><input id="acc-token" placeholder="e.g. 7c9f4..."></div>
+      <div><label>&nbsp;</label><button onclick="useToken()">Unlock</button></div>
+    </div>
+  </fieldset>
+</div>
+
+<p class="meta" style="margin-top:16px;font-size:11px">
+  Read the <a href="/health" style="color:#58a6ff">/health</a> endpoint without a token if you just want to verify the demo is up. Source: <a href="https://github.com/ccie7599/nats-kv" style="color:#58a6ff">github.com/ccie7599/nats-kv</a>.
+</p>
+
+<script>
+async function submitRequest() {
+  const name = document.getElementById("rq-name").value.trim();
+  const email = document.getElementById("rq-email").value.trim();
+  const reason = document.getElementById("rq-reason").value.trim();
+  const out = document.getElementById("out");
+  if (!name || !email) {
+    out.className = "err"; out.textContent = "name and email required"; return;
+  }
+  try {
+    const r = await fetch("/api/request-invite", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, email, reason }),
+    });
+    if (r.ok) {
+      out.className = "ok";
+      out.textContent = "Thanks — request received. Brian will follow up with an access link once approved.";
+      document.getElementById("rq-name").value = "";
+      document.getElementById("rq-email").value = "";
+      document.getElementById("rq-reason").value = "";
+    } else {
+      const j = await r.json().catch(()=>({error:`HTTP ${r.status}`}));
+      out.className = "err"; out.textContent = "Submit failed: " + (j.error || r.status);
+    }
+  } catch (e) {
+    out.className = "err"; out.textContent = "Submit failed: " + e.message;
+  }
+}
+function useToken() {
+  const t = document.getElementById("acc-token").value.trim();
+  if (!t) return;
+  // The server sees ?access=<t>, validates, sets cookie, and 302s back to /
+  window.location = "/?access=" + encodeURIComponent(t);
+}
 </script>
 </body></html>
 "##;

@@ -66,6 +66,14 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/internal/keys", s.internalKeysHandler)
 	s.mux.HandleFunc("/v1/internal/buckets/ensure", s.internalEnsureBucketHandler)
 
+	// Public POST — gated user-app submits "request access" form here. Stored
+	// in NATS KV for admin review. No auth (open form).
+	s.mux.HandleFunc("/v1/internal/invite-requests", s.internalInviteRequestHandler)
+
+	// Admin — list pending invite requests + decide them.
+	s.mux.HandleFunc("/v1/admin/invite-requests", s.adminOnly(s.adminListInviteRequestsHandler))
+	s.mux.HandleFunc("/v1/admin/invite-requests/", s.adminOnly(s.adminDecideInviteRequestHandler))
+
 	// User self-service — bearer = user API key
 	s.mux.HandleFunc("/v1/me", s.userOnly(s.meHandler))
 	s.mux.HandleFunc("/v1/me/buckets", s.userOnly(s.userBucketsHandler))
@@ -601,6 +609,161 @@ func (s *Server) internalKeysHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"keys": keys})
+}
+
+// --- Invite Request handlers (UI gate "request access" queue) ---
+
+// internalInviteRequestHandler accepts a name+email+reason POST from the
+// gated user-app's request form and queues it in NATS KV for admin review.
+// No auth — visitors aren't authenticated yet (that's the whole point of the form).
+// Light shape validation only; full sanitization on render.
+func (s *Server) internalInviteRequestHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Name   string `json:"name"`
+		Email  string `json:"email"`
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, 400, map[string]any{"error": "bad json"})
+		return
+	}
+	body.Name = strings.TrimSpace(body.Name)
+	body.Email = strings.TrimSpace(body.Email)
+	body.Reason = strings.TrimSpace(body.Reason)
+	if body.Name == "" || body.Email == "" {
+		writeJSON(w, 400, map[string]any{"error": "name and email required"})
+		return
+	}
+	if len(body.Name) > 200 || len(body.Email) > 200 || len(body.Reason) > 2000 {
+		writeJSON(w, 400, map[string]any{"error": "field too long"})
+		return
+	}
+	now := time.Now().UTC()
+	id := fmt.Sprintf("r_%s_%s",
+		strconv.FormatInt(now.Unix(), 36),
+		tenant.NewID("")[:8],
+	)
+	req := &tenant.InviteRequest{
+		ID:        id,
+		Name:      body.Name,
+		Email:     body.Email,
+		Reason:    body.Reason,
+		UserAgent: r.Header.Get("User-Agent"),
+		RemoteIP:  clientIP(r),
+		CreatedAt: now,
+		Status:    "pending",
+	}
+	if err := s.store.PutInviteRequest(req); err != nil {
+		writeJSON(w, 500, map[string]any{"error": "store: " + err.Error()})
+		return
+	}
+	s.store.Audit(r.Context(), "internal", "invite-request.create", "invite_request", id, body.Email)
+	writeJSON(w, 200, map[string]any{"id": id, "status": "pending"})
+}
+
+// adminListInviteRequestsHandler returns all invite requests, optionally filtered
+// by status (?status=pending|approved|declined). Admin auth.
+func (s *Server) adminListInviteRequestsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	all, err := s.store.ListInviteRequests()
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		return
+	}
+	wantStatus := r.URL.Query().Get("status")
+	out := make([]*tenant.InviteRequest, 0, len(all))
+	for _, ir := range all {
+		if wantStatus == "" || ir.Status == wantStatus {
+			out = append(out, ir)
+		}
+	}
+	writeJSON(w, 200, map[string]any{"requests": out})
+}
+
+// adminDecideInviteRequestHandler decides an invite request:
+//   POST /v1/admin/invite-requests/<id>/approve  → mints an Invite, returns claim URL
+//   POST /v1/admin/invite-requests/<id>/decline  → marks declined, optional ?note=
+func (s *Server) adminDecideInviteRequestHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, "/v1/admin/invite-requests/")
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) != 2 {
+		writeJSON(w, 400, map[string]any{"error": "expected /v1/admin/invite-requests/<id>/<approve|decline>"})
+		return
+	}
+	id, action := parts[0], parts[1]
+	ir, err := s.store.GetInviteRequest(id)
+	if err != nil {
+		writeJSON(w, 404, map[string]any{"error": "request not found"})
+		return
+	}
+	if ir.Status != "pending" {
+		writeJSON(w, 409, map[string]any{"error": "already decided", "status": ir.Status})
+		return
+	}
+	now := time.Now().UTC()
+	ir.DecidedAt = &now
+	ir.DecidedBy = "admin"
+	ir.Note = r.URL.Query().Get("note")
+
+	switch action {
+	case "approve":
+		// Mint an Invite using the existing flow: 7d expiry, tag = email handle
+		token := tenant.NewID("k_inv_")
+		inv := &tenant.Invite{
+			Token:     token,
+			Tag:       ir.Email,
+			CreatedBy: "admin (request " + id + ")",
+			CreatedAt: now,
+			ExpiresAt: now.Add(7 * 24 * time.Hour),
+		}
+		if err := s.store.CreateInvite(r.Context(), inv); err != nil {
+			writeJSON(w, 500, map[string]any{"error": "create invite: " + err.Error()})
+			return
+		}
+		ir.Status = "approved"
+		ir.InviteToken = token
+		_ = s.store.PutInviteRequest(ir)
+		s.store.Audit(r.Context(), "admin", "invite-request.approve", "invite_request", id, token)
+		// Build the gated claim URL — anyone with this URL can claim the invite,
+		// AND because the user app's gate accepts ?access=<ui_gate_token>, we
+		// hand back both. Admin app concatenates as needed.
+		writeJSON(w, 200, map[string]any{
+			"id":           ir.ID,
+			"status":       "approved",
+			"invite_token": token,
+			"claim_path":   "/claim/" + token,
+		})
+	case "decline":
+		ir.Status = "declined"
+		_ = s.store.PutInviteRequest(ir)
+		s.store.Audit(r.Context(), "admin", "invite-request.decline", "invite_request", id, ir.Note)
+		writeJSON(w, 200, map[string]any{"id": ir.ID, "status": "declined"})
+	default:
+		writeJSON(w, 400, map[string]any{"error": "action must be approve|decline"})
+	}
+}
+
+// clientIP extracts the best-effort client IP from request headers (X-Forwarded-For
+// chain with fallback to RemoteAddr).
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if i := strings.Index(xff, ","); i > 0 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
+	return r.RemoteAddr
 }
 
 // --- Admin auth middleware ---

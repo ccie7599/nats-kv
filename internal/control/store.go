@@ -18,9 +18,10 @@ import (
 // watch for live revocation.
 // Invites → SQLite on the hub, since they are admin-only one-shot tokens.
 type Store struct {
-	tenants nats.KeyValue // bucket: kv-admin-tenants
-	keys    nats.KeyValue // bucket: kv-admin-keys
-	db      *sql.DB
+	tenants        nats.KeyValue // bucket: kv-admin-tenants
+	keys           nats.KeyValue // bucket: kv-admin-keys
+	inviteRequests nats.KeyValue // bucket: kv-admin-invite-requests-v1 (UI gate "request access" queue)
+	db             *sql.DB
 }
 
 func NewStore(js nats.JetStreamContext, db *sql.DB) (*Store, error) {
@@ -53,12 +54,23 @@ func NewStore(js nats.JetStreamContext, db *sql.DB) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("keys bucket: %w", err)
 	}
+	irb, err := openOrCreate(js, &nats.KeyValueConfig{
+		Bucket:      "kv-admin-invite-requests-v1",
+		Description: "UI-gate invite request queue from gated user app",
+		History:     8,
+		Storage:     nats.FileStorage,
+		Replicas:    5,
+		Placement:   &nats.Placement{Tags: []string{"geo:na"}},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("invite-requests bucket: %w", err)
+	}
 
 	if err := bootstrapSchema(db); err != nil {
 		return nil, fmt.Errorf("sqlite schema: %w", err)
 	}
 
-	return &Store{tenants: tb, keys: kb, db: db}, nil
+	return &Store{tenants: tb, keys: kb, inviteRequests: irb, db: db}, nil
 }
 
 func openOrCreate(js nats.JetStreamContext, cfg *nats.KeyValueConfig) (nats.KeyValue, error) {
@@ -300,6 +312,49 @@ func (s *Store) ListInvites(ctx context.Context, includeClaimed bool) ([]*tenant
 func (s *Store) RevokeInvite(ctx context.Context, token string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM invites WHERE token = ? AND claimed_at IS NULL`, token)
 	return err
+}
+
+// --- Invite Requests (UI gate queue, NATS KV) ---
+
+func (s *Store) PutInviteRequest(r *tenant.InviteRequest) error {
+	b, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	_, err = s.inviteRequests.Put(r.ID, b)
+	return err
+}
+
+func (s *Store) GetInviteRequest(id string) (*tenant.InviteRequest, error) {
+	e, err := s.inviteRequests.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	var r tenant.InviteRequest
+	if err := json.Unmarshal(e.Value(), &r); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+// ListInviteRequests returns every request (oldest first). Caller filters by status.
+func (s *Store) ListInviteRequests() ([]*tenant.InviteRequest, error) {
+	keys, err := s.inviteRequests.Keys()
+	if errors.Is(err, nats.ErrNoKeysFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*tenant.InviteRequest, 0, len(keys))
+	for _, k := range keys {
+		r, err := s.GetInviteRequest(k)
+		if err != nil {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out, nil
 }
 
 // --- Audit ---

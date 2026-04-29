@@ -68,6 +68,24 @@ type Invite struct {
 	TenantID  string    `json:"tenant_id,omitempty"`
 }
 
+// InviteRequest is a "please grant me access" submission from a visitor on the
+// gated user app. Stored in NATS KV so the admin app can list pending requests
+// and approve them — approval mints an Invite and binds it back to the request.
+type InviteRequest struct {
+	ID          string     `json:"id"`           // r_<base36-ts>-<rand>
+	Name        string     `json:"name"`
+	Email       string     `json:"email"`
+	Reason      string     `json:"reason,omitempty"`
+	UserAgent   string     `json:"user_agent,omitempty"`
+	RemoteIP    string     `json:"remote_ip,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	Status      string     `json:"status"`       // "pending" | "approved" | "declined"
+	InviteToken string     `json:"invite_token,omitempty"` // set when approved
+	DecidedAt   *time.Time `json:"decided_at,omitempty"`
+	DecidedBy   string     `json:"decided_by,omitempty"`
+	Note        string     `json:"note,omitempty"` // free-form admin note on decline/approve
+}
+
 func (i *Invite) Valid(now time.Time) error {
 	if !i.ClaimedAt.IsZero() {
 		return errors.New("invite already claimed")

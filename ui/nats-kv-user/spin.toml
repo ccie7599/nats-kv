@@ -8,6 +8,13 @@ version = "0.1.0"
 authors = ["ccie7599 <brian@apley.net>"]
 description = "NATS KV demo UI"
 
+# Gate token for the UI itself (separate from KV bearer keys).
+# Visitors land on a "request invite" page; admins share a `?access=<token>`
+# URL with vetted users to unlock the full UI. Token is set via
+# `spin aka variables set ui_gate_token=<value>`.
+[variables]
+ui_gate_token = { default = "demo-open-2026" }
+
 [[trigger.http]]
 route = "/..."
 component = "nats-kv-user"
@@ -23,6 +30,8 @@ allowed_outbound_hosts = [
   "https://ipinfo.io",
 ]
 key_value_stores = ["default"]
+[component.nats-kv-user.variables]
+ui_gate_token = "{{ ui_gate_token }}"
 [component.nats-kv-user.build]
 command = "cargo build --target wasm32-wasip1 --release"
 watch = ["src/**/*.rs", "Cargo.toml"]
