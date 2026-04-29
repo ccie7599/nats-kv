@@ -20,6 +20,9 @@ async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
     if path == "/dash" || path == "/dash/" {
         return html(DASH_HTML);
     }
+    if path == "/topology" || path == "/topology/" {
+        return html(TOPOLOGY_HTML);
+    }
     if path.starts_with("/claim/") {
         return html(CLAIM_HTML);
     }
@@ -249,6 +252,7 @@ function renderNav(active) {
     <nav>
       <a href="/" ${active==='home'?'style="text-decoration:underline"':''}>home</a>
       <a href="/play" ${active==='play'?'style="text-decoration:underline"':''}>playground</a>
+      <a href="/topology" ${active==='topology'?'style="text-decoration:underline"':''}>topology</a>
       <a href="/dash" ${active==='dash'?'style="text-decoration:underline"':''}>dashboard</a>
       <span class="key-status ${k?'ok':''}">${k ? 'signed in: '+t+' • key '+k.slice(0,12)+'…' : 'no key (using shared demo)'}</span>
     </nav>
@@ -406,6 +410,213 @@ async function loadBuckets() {
   const text = atob(j.body_b64 || "");
   document.getElementById("buckets-out").textContent = text;
 }
+</script>
+</body></html>
+"##;
+
+const TOPOLOGY_HTML: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>NATS-KV topology</title><style>__SHARED_CSS__
+  svg { background:#0d1117; border:1px solid #30363d; border-radius:6px; display:block; margin:0 auto; }
+  .land { fill:#161b22; stroke:#21262d; stroke-width:0.5; }
+  .grid { stroke:#21262d; stroke-width:0.5; fill:none; }
+  .region-dot { fill:#30363d; stroke:#8b949e; stroke-width:0.5; }
+  .region-dot.has-bucket { fill:#58a6ff; }
+  .region-label { fill:#8b949e; font-size:9px; text-anchor:middle; pointer-events:none; }
+  .raft-edge { stroke-width:2; fill:none; opacity:0.8; }
+  .raft-fill { fill-opacity:0.15; stroke:none; }
+  .leader-ring { fill:none; stroke-width:2; }
+  .bucket-row { padding:6px 8px; border-bottom:1px solid #30363d; cursor:pointer; }
+  .bucket-row:hover { background:#161b22; }
+  .bucket-row.active { background:#1f2933; }
+  .pill { display:inline-block; padding:2px 6px; border-radius:3px; font-size:10px; margin-right:4px; background:#30363d; }
+  .pill.r1 { background:#8b949e; color:#0d1117; }
+  .pill.r3 { background:#3fb950; color:#0d1117; }
+  .pill.r5 { background:#d29922; color:#0d1117; }
+  .pill.mirror { background:#bc8cff; color:#0d1117; }
+  .lag { font-family:ui-monospace, monospace; }
+  .lag.ok { color:#3fb950; } .lag.warn { color:#d29922; } .lag.err { color:#f85149; }
+  legend.geo { display:flex; gap:12px; font-size:11px; margin:0; padding:0 8px 6px 8px; flex-wrap:wrap; }
+  .swatch { display:inline-block; width:10px; height:10px; border-radius:50%; vertical-align:middle; margin-right:4px; }
+</style></head><body>
+<h1>Consistency-domain topology</h1>
+<p class="sub">Each bucket's RAFT replica set rendered geographically. Live replication lag per replica from the JetStream stream metadata.</p>
+
+<fieldset>
+  <legend>Buckets <span id="b-count" class="meta"></span></legend>
+  <legend class="geo">
+    <span><span class="swatch" style="background:#58a6ff"></span>has bucket</span>
+    <span><span class="swatch" style="background:#3fb950"></span>R3 leader/replica</span>
+    <span><span class="swatch" style="background:#d29922"></span>R5</span>
+    <span><span class="swatch" style="background:#bc8cff"></span>mirror</span>
+    <span><span class="swatch" style="background:#8b949e"></span>R1 (no replication)</span>
+  </legend>
+  <div id="bucket-list" style="max-height:200px; overflow:auto; border:1px solid #30363d; border-radius:4px;"></div>
+  <div class="actions">
+    <button class="secondary" onclick="loadAll()">Refresh</button>
+    <button class="secondary" onclick="autoRefresh()" id="auto-btn">Auto-refresh (off)</button>
+  </div>
+</fieldset>
+
+<svg id="map" viewBox="0 0 1000 500" width="100%" preserveAspectRatio="xMidYMid meet">
+  <defs>
+    <pattern id="grid" width="50" height="50" patternUnits="userSpaceOnUse">
+      <path d="M 50 0 L 0 0 0 50" class="grid"/>
+    </pattern>
+    <radialGradient id="leader-glow"><stop offset="0%" stop-color="#3fb950" stop-opacity="0.6"/><stop offset="100%" stop-color="#3fb950" stop-opacity="0"/></radialGradient>
+  </defs>
+  <rect width="1000" height="500" fill="url(#grid)"/>
+  <g id="dots"></g>
+  <g id="overlay"></g>
+  <g id="labels"></g>
+</svg>
+
+<fieldset id="bucket-detail" style="margin-top:16px; display:none">
+  <legend>Bucket detail</legend>
+  <div id="detail-out"></div>
+</fieldset>
+
+<script>__NAV_JS__
+renderNav('topology');
+const REGIONS = {
+  "us-ord":       { lat: 41.8781,  lon: -87.6298,  geo: "na" },
+  "us-east":      { lat: 40.7357,  lon: -74.1724,  geo: "na" },
+  "us-central":   { lat: 32.7767,  lon: -96.7970,  geo: "na" },
+  "us-west":      { lat: 37.5485,  lon: -121.9886, geo: "na" },
+  "us-southeast": { lat: 33.7490,  lon: -84.3880,  geo: "na" },
+  "us-lax":       { lat: 34.0522,  lon: -118.2437, geo: "na" },
+  "us-mia":       { lat: 25.7617,  lon: -80.1918,  geo: "na" },
+  "us-sea":       { lat: 47.6062,  lon: -122.3321, geo: "na" },
+  "ca-central":   { lat: 43.6532,  lon: -79.3832,  geo: "na" },
+  "br-gru":       { lat: -23.5505, lon: -46.6333,  geo: "sa" },
+  "gb-lon":       { lat: 51.5074,  lon: -0.1278,   geo: "eu" },
+  "eu-central":   { lat: 50.1109,  lon: 8.6821,    geo: "eu" },
+  "de-fra-2":     { lat: 50.1109,  lon: 8.6821,    geo: "eu" },
+  "fr-par-2":     { lat: 48.8566,  lon: 2.3522,    geo: "eu" },
+  "nl-ams":       { lat: 52.3676,  lon: 4.9041,    geo: "eu" },
+  "se-sto":       { lat: 59.3293,  lon: 18.0686,   geo: "eu" },
+  "it-mil":       { lat: 45.4642,  lon: 9.1900,    geo: "eu" },
+  "ap-south":     { lat: 1.3521,   lon: 103.8198,  geo: "ap" },
+  "sg-sin-2":     { lat: 1.3521,   lon: 103.8198,  geo: "ap" },
+  "ap-northeast": { lat: 35.6762,  lon: 139.6503,  geo: "ap" },
+  "jp-tyo-3":     { lat: 35.6762,  lon: 139.6503,  geo: "ap" },
+  "jp-osa":       { lat: 34.6937,  lon: 135.5023,  geo: "ap" },
+  "ap-west":      { lat: 19.0760,  lon: 72.8777,   geo: "ap" },
+  "in-bom-2":     { lat: 19.0760,  lon: 72.8777,   geo: "ap" },
+  "in-maa":       { lat: 13.0827,  lon: 80.2707,   geo: "ap" },
+  "id-cgk":       { lat: -6.2088,  lon: 106.8456,  geo: "ap" },
+  "ap-southeast": { lat: -33.8688, lon: 151.2093,  geo: "oc" }
+};
+function proj(lat, lon) {
+  const x = (lon + 180) / 360 * 1000;
+  const y = (90 - lat) / 180 * 500;
+  return [x, y];
+}
+function regionFromPeer(name) {
+  return name.replace(/^kv-/, "");
+}
+
+function drawDots(activeRegions) {
+  const g = document.getElementById("dots");
+  const lab = document.getElementById("labels");
+  g.innerHTML = ""; lab.innerHTML = "";
+  for (const [r, m] of Object.entries(REGIONS)) {
+    const [x,y] = proj(m.lat, m.lon);
+    const cls = activeRegions.has(r) ? "region-dot has-bucket" : "region-dot";
+    g.insertAdjacentHTML("beforeend", `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3" class="${cls}"><title>${r}</title></circle>`);
+    lab.insertAdjacentHTML("beforeend", `<text x="${x.toFixed(1)}" y="${(y+12).toFixed(1)}" class="region-label">${r}</text>`);
+  }
+}
+
+let currentBuckets = [];
+let activeBucket = null;
+
+async function loadAll() {
+  drawDots(new Set());
+  const r = await authedFetch("/api/nats/v1/admin/buckets");
+  const j = await r.json();
+  if (!r.ok || j.status >= 400) {
+    document.getElementById("bucket-list").innerHTML = `<div class="err" style="padding:8px">${j.error || j.body_b64 || ('HTTP ' + r.status)}</div>`;
+    return;
+  }
+  // The proxy wraps result; actual body is base64 JSON
+  let payload;
+  try { payload = JSON.parse(atob(j.body_b64 || "")); } catch (e) { payload = j; }
+  currentBuckets = (payload.buckets || []).filter(b => !b.name.startsWith("kv-admin"));
+  document.getElementById("b-count").textContent = `(${currentBuckets.length})`;
+  const list = document.getElementById("bucket-list");
+  list.innerHTML = currentBuckets.map((b, i) => {
+    const repClass = b.replicas === 5 ? "r5" : b.replicas === 3 ? "r3" : "r1";
+    const peers = (b.peers || []).map(p => p.name.replace(/^kv-/,'')).join(", ");
+    return `<div class="bucket-row" onclick="selectBucket(${i})" id="bucket-row-${i}">
+      <span class="pill ${repClass}">R${b.replicas||1}</span>
+      <strong>${b.name}</strong>
+      <span class="meta"> · ${b.values||0} values · ${(b.bytes||0)} bytes · peers: ${peers||'(none)'}</span>
+    </div>`;
+  }).join("") || '<div class="meta" style="padding:8px">no buckets yet</div>';
+  // collect active regions across all buckets
+  const active = new Set();
+  for (const b of currentBuckets) {
+    for (const p of (b.peers || [])) active.add(regionFromPeer(p.name));
+  }
+  drawDots(active);
+  if (currentBuckets.length > 0) selectBucket(0);
+}
+
+function selectBucket(i) {
+  activeBucket = i;
+  document.querySelectorAll(".bucket-row").forEach((el, j) => el.classList.toggle("active", j === i));
+  const b = currentBuckets[i];
+  // overlay: triangle of peer points + leader ring
+  const overlay = document.getElementById("overlay");
+  overlay.innerHTML = "";
+  const pts = (b.peers || []).map(p => {
+    const r = regionFromPeer(p.name);
+    const m = REGIONS[r];
+    if (!m) return null;
+    const [x,y] = proj(m.lat, m.lon);
+    return { x, y, region: r, role: p.role, current: p.current, lag_ms: p.lag_ms };
+  }).filter(Boolean);
+  const repClass = b.replicas === 5 ? "r5" : b.replicas === 3 ? "r3" : "r1";
+  const color = b.replicas === 5 ? "#d29922" : b.replicas === 3 ? "#3fb950" : "#8b949e";
+  if (pts.length >= 2) {
+    const poly = pts.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+    overlay.insertAdjacentHTML("beforeend", `<polygon points="${poly}" class="raft-fill" style="fill:${color}"/>`);
+    overlay.insertAdjacentHTML("beforeend", `<polyline points="${poly} ${pts[0].x.toFixed(1)},${pts[0].y.toFixed(1)}" class="raft-edge" style="stroke:${color}"/>`);
+  }
+  for (const p of pts) {
+    if (p.role === "leader") {
+      overlay.insertAdjacentHTML("beforeend", `<circle cx="${p.x}" cy="${p.y}" r="14" fill="url(#leader-glow)"/>`);
+      overlay.insertAdjacentHTML("beforeend", `<circle cx="${p.x}" cy="${p.y}" r="6" class="leader-ring" style="stroke:${color}"/>`);
+    }
+    overlay.insertAdjacentHTML("beforeend", `<circle cx="${p.x}" cy="${p.y}" r="4" style="fill:${color}"><title>${p.region} (${p.role})</title></circle>`);
+  }
+  // detail
+  const det = document.getElementById("detail-out");
+  det.innerHTML = `
+    <div><strong>${b.name}</strong> <span class="pill ${repClass}">R${b.replicas||1}</span></div>
+    <div class="meta">cluster: ${b.cluster||'?'} · values: ${b.values||0} · bytes: ${b.bytes||0} · history: ${b.history||0}</div>
+    <table style="width:100%; margin-top:8px; font-size:12px;">
+      <thead><tr><th style="text-align:left">Peer</th><th>Role</th><th>Current</th><th>Lag (ms)</th></tr></thead>
+      <tbody>${(b.peers||[]).map(p => `
+        <tr>
+          <td>${p.name}</td>
+          <td>${p.role}</td>
+          <td>${p.current ? '<span class="ok">✓</span>' : '<span class="err">✗</span>'}</td>
+          <td class="lag ${p.lag_ms<10?'ok':p.lag_ms<100?'warn':'err'}">${p.lag_ms||0}</td>
+        </tr>`).join("")}</tbody>
+    </table>
+  `;
+  document.getElementById("bucket-detail").style.display = "block";
+}
+
+let timer = null;
+function autoRefresh() {
+  if (timer) { clearInterval(timer); timer = null; document.getElementById("auto-btn").textContent = "Auto-refresh (off)"; return; }
+  timer = setInterval(loadAll, 5000);
+  document.getElementById("auto-btn").textContent = "Auto-refresh (5s)";
+}
+
+loadAll();
 </script>
 </body></html>
 "##;
