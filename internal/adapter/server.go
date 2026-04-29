@@ -185,10 +185,23 @@ func (s *Server) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 	for sn := range s.cfg.JS.StreamNames() {
 		allStreams = append(allStreams, sn)
 	}
-	out := []map[string]any{}
-	for name := range s.cfg.JS.KeyValueStoreNames() {
-		out = append(out, s.bucketSummary(name, allStreams))
+	// Parallelize per-bucket lookups — each StreamInfo crosses to the source's
+	// leader region, so 5 sequential = 5 × cross-region RTT (~3s). Fan out and
+	// the wall-clock cost becomes max(per-bucket) ≈ one cross-region RTT.
+	names := []string{}
+	for n := range s.cfg.JS.KeyValueStoreNames() {
+		names = append(names, n)
 	}
+	out := make([]map[string]any, len(names))
+	var wg sync.WaitGroup
+	for i, n := range names {
+		wg.Add(1)
+		go func(i int, n string) {
+			defer wg.Done()
+			out[i] = s.bucketSummary(n, allStreams)
+		}(i, n)
+	}
+	wg.Wait()
 	_ = json.NewEncoder(w).Encode(map[string]any{"buckets": out, "served_by": s.cfg.Region})
 }
 
@@ -199,17 +212,6 @@ func (s *Server) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 // the cluster's stream catalog once per bucket.
 func (s *Server) bucketSummary(name string, allStreams []string) map[string]any {
 	entry := map[string]any{"name": name}
-	kv, err := s.cfg.JS.KeyValue(name)
-	if err != nil {
-		entry["error"] = err.Error()
-		return entry
-	}
-	st, _ := kv.Status()
-	if st != nil {
-		entry["values"] = st.Values()
-		entry["history"] = st.History()
-		entry["bytes"] = st.Bytes()
-	}
 	streamName := "KV_" + name
 
 	// Find mirror streams pointing at this bucket. We synthesize the per-mirror
@@ -236,11 +238,17 @@ func (s *Server) bucketSummary(name string, allStreams []string) map[string]any 
 		entry["mirrors"] = mirrors
 	}
 
-	// Stream backing the KV bucket has name "KV_<bucket>"
+	// Single StreamInfo fetches everything we need: config, cluster, state.
+	// kv.Status() under the hood also calls StreamInfo, so calling both was
+	// two cross-region round-trips per bucket; sticking to one cuts list
+	// latency in half.
 	if info, err := s.cfg.JS.StreamInfo(streamName); err == nil && info != nil {
 		entry["replicas"] = info.Config.Replicas
 		entry["mirror"] = info.Config.Mirror
 		entry["sources"] = info.Config.Sources
+		entry["history"] = info.Config.MaxMsgsPerSubject
+		entry["values"] = info.State.Msgs
+		entry["bytes"] = info.State.Bytes
 		entry["placement_tags"] = nil
 		if info.Config.Placement != nil {
 			entry["placement_tags"] = info.Config.Placement.Tags

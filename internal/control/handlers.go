@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bapley/project-nats-kv/internal/placement"
@@ -184,14 +185,22 @@ func (s *Server) userBucketsHandler(w http.ResponseWriter, r *http.Request, t *t
 		}
 		prefix := t.ID + "__"
 		names := []string{}
-		details := []map[string]any{}
 		for name := range s.js.KeyValueStoreNames() {
-			if !strings.HasPrefix(name, prefix) {
-				continue
+			if strings.HasPrefix(name, prefix) {
+				names = append(names, name)
 			}
-			names = append(names, name)
-			details = append(details, s.bucketDetails(name, allStreams))
 		}
+		// Parallel StreamInfo per bucket — wall-clock cost ≈ one cross-region RTT.
+		details := make([]map[string]any, len(names))
+		var wg sync.WaitGroup
+		for i, n := range names {
+			wg.Add(1)
+			go func(i int, n string) {
+				defer wg.Done()
+				details[i] = s.bucketDetails(n, allStreams)
+			}(i, n)
+		}
+		wg.Wait()
 		writeJSON(w, 200, map[string]any{"buckets": names, "details": details, "tenant_id": t.ID})
 	case http.MethodPost:
 		s.createUserBucket(w, r, t)
