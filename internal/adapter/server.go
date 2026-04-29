@@ -24,10 +24,16 @@ type Server struct {
 	cfg     Config
 	mux     *http.ServeMux
 	started time.Time
+	keys    *KeyCache
 }
 
 func New(cfg Config) *Server {
-	s := &Server{cfg: cfg, mux: http.NewServeMux(), started: time.Now()}
+	s := &Server{
+		cfg:     cfg,
+		mux:     http.NewServeMux(),
+		started: time.Now(),
+		keys:    NewKeyCache(cfg.JS, cfg.DemoToken),
+	}
 	s.routes()
 	return s
 }
@@ -99,10 +105,11 @@ func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	info, _ := s.cfg.JS.AccountInfo()
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"region":   s.cfg.Region,
-		"server":   s.cfg.NC.ConnectedServerName(),
-		"cluster":  s.cfg.NC.ConnectedClusterName(),
-		"account":  info,
+		"region":      s.cfg.Region,
+		"server":      s.cfg.NC.ConnectedServerName(),
+		"cluster":     s.cfg.NC.ConnectedClusterName(),
+		"account":     info,
+		"keys_loaded": s.keys.Size(),
 	})
 }
 
@@ -179,7 +186,21 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) authOK(r *http.Request) bool {
 	got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	return got == s.cfg.DemoToken
+	if got == "" {
+		return false
+	}
+	_, ok := s.keys.Validate(got)
+	return ok
+}
+
+// authTenant returns (tenant_id, ok) for the request's bearer token.
+// "demo" for the shared demo token, the real tenant ID otherwise.
+func (s *Server) authTenant(r *http.Request) (string, bool) {
+	got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if got == "" {
+		return "", false
+	}
+	return s.keys.Validate(got)
 }
 
 func (s *Server) ensureBucket(bucket string) (nats.KeyValue, error) {
