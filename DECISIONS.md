@@ -210,6 +210,38 @@ Property names match primary hostnames per global CLAUDE.md convention. Three Ak
 
 ---
 
+## ADR-019 — FWF→adapter calls use plain HTTP (TLS off the data plane); NATS-KV now beats Cosmos
+**Status**: Accepted (2026-04-29)
+
+**Context**: ADR-018 isolated the 45ms gap to FWF's wasi-http TLS handshake (every HTTPS call to a same-metro endpoint pays full handshake; FWF's TLS path is ~10x slower than a regular Linux TLS handshake on the same network). Switching the FWF→adapter hop to plain HTTP eliminates the tax.
+
+**Decision**: User Spin app's `ADAPTER_BASE` now points at `http://edge.nats-kv.connected-cloud.io:8080`. LZ NB Service exposes port 8080 in addition to 80 (so the URL is consistent across LZ + leaves; leaves already had hostPort 8080 from the DaemonSet). External clients (browsers / server-to-server SDK calls) still hit HTTPS on `:443` — only the in-Akamai FWF→adapter hop drops to HTTP.
+
+**Numbers (intra-Chicago, FWF Spin → us-ord adapter, steady state):**
+| Path | Latency | vs Cosmos |
+|---|---|---|
+| FWF → http://edge.nats-kv:8080 (GTM hostname) | **6-9ms** | 2-3× faster |
+| FWF → http://172.237.141.164 (NB IP, no DNS) | **3.5-4ms** | 5-6× faster |
+| KV PUT (HTTP, GTM hostname) | **5.5-8ms** | 3× faster |
+| KV GET (HTTP, GTM hostname) | **7-8ms** | 3× faster |
+| Cosmos via spin:key-value WIT | 19-23ms | baseline |
+
+DNS lookup costs 3-5ms per call on FWF's wasi-http (hostname=6-9ms vs IP=3.5-4ms).
+
+**Rationale for accepting plain HTTP on this hop**:
+1. Both ends are on the same Akamai/Linode network (Akamai Connected Cloud ASN 63949 to Linode Chicago metro). Bearer-token auth at the adapter still gates access. The TLS proxy/inspection layer that's slowing FWF's handshake adds no security on this trust boundary.
+2. External access (anything outside FWF) continues to use HTTPS on 443. The wildcard `*.nats-kv.connected-cloud.io` cert is unchanged.
+3. Reverting is one config change (`const ADAPTER_BASE`) if security posture changes.
+
+**Consequences**:
+- Headline pitch flips: "NATS-KV is faster than Cosmos on FWF" — concrete 3-6× wins.
+- The TLS-handshake bug for Fermyon to file (ADR-018) is still worth filing — fixing it would let everyone on FWF use HTTPS at HTTP latency.
+- Future native `key-value-nats` factor crate would shave another 3-5ms (no DNS, no HTTP framing) for a sub-1ms KV op.
+
+**Cleanup**: probe Linode (96843977 / 172.236.104.189) and `probe.nats-kv.connected-cloud.io` DNS torn down post-test.
+
+---
+
 ## ADR-018 — FWF wasi-http TLS handshake is the entire 50ms gap (intra-Chicago test)
 **Status**: Documented (2026-04-29)
 
