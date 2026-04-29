@@ -81,20 +81,38 @@ func main() {
 	probeCtx, probeCancel := context.WithCancel(context.Background())
 	defer probeCancel()
 	if placer != nil {
-		bootstrapCtx, bcancel := context.WithTimeout(probeCtx, 30*time.Second)
-		if d, err := srv.EnsureSharedBucket(bootstrapCtx, probe.BucketName, "us-ord", 3, true,
-			"topology freshness probe — auto-managed"); err != nil {
-			log.Printf("probe bootstrap: %v (freshness page will 503 until this resolves)", err)
-		} else if d != nil {
-			log.Printf("probe bootstrap: created %s in %s", probe.BucketName, d.ChosenGeo)
-		} else {
-			log.Printf("probe bootstrap: %s already exists", probe.BucketName)
-		}
-		bcancel()
-		prober := probe.New(js)
-		go prober.Run(probeCtx)
-		srv.SetProber(prober)
-		log.Print("topology freshness probe started (5s interval)")
+		go func() {
+			// Retry bootstrap until it succeeds — placement engine needs to
+			// fetch the latency matrix, which can be slow on a cold CDN.
+			for attempt := 1; ; attempt++ {
+				ctx, cancel := context.WithTimeout(probeCtx, 60*time.Second)
+				d, err := srv.EnsureSharedBucket(ctx, probe.BucketName, "us-ord", 3, true,
+					"topology freshness probe — auto-managed")
+				cancel()
+				if err == nil {
+					if d != nil {
+						log.Printf("probe bootstrap: created %s in %s (attempt %d)", probe.BucketName, d.ChosenGeo, attempt)
+					} else {
+						log.Printf("probe bootstrap: %s already exists (attempt %d)", probe.BucketName, attempt)
+					}
+					prober := probe.New(js)
+					go prober.Run(probeCtx)
+					srv.SetProber(prober)
+					log.Print("topology freshness probe started (5s interval)")
+					return
+				}
+				wait := time.Duration(attempt*5) * time.Second
+				if wait > 60*time.Second {
+					wait = 60 * time.Second
+				}
+				log.Printf("probe bootstrap attempt %d failed: %v (retry in %s)", attempt, err, wait)
+				select {
+				case <-probeCtx.Done():
+					return
+				case <-time.After(wait):
+				}
+			}
+		}()
 	} else {
 		log.Print("topology freshness probe disabled (placement engine unavailable)")
 	}

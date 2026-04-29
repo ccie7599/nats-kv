@@ -53,7 +53,7 @@ func NewClient(baseURL, authToken string) *Client {
 	return &Client{
 		BaseURL:   baseURL,
 		AuthToken: authToken,
-		HTTP:      &http.Client{Timeout: 5 * time.Second},
+		HTTP:      &http.Client{Timeout: 15 * time.Second}, // 5s was too tight when the latency hub is CDN-cold
 		TTL:       60 * time.Second,
 	}
 }
