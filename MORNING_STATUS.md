@@ -54,8 +54,8 @@ The 27-node "mesh" was actually **hub-and-spoke** — each leaf had 4 routes, al
 
 ## Open / known-not-quite-right
 
-- **Mirrors don't auto-create** when a new bucket is created via `nats kv add`. The 5 demo buckets had mirrors hand-crafted via `nats stream add`. To productize: add per-tenant bucket-creation API on control plane that takes geo + replicas + want_mirrors, calls the placement engine, then creates RAFT stream + N mirror streams in one call.
-- **Per-tenant bucket creation API** not yet exposed. Today only admins can create buckets via `nats kv add` CLI. Users on the dashboard see existing buckets but can't create their own.
+- **Latency-driven placement engine (#4 proper)** — placement currently uses static `geo:` tags. Next: read pairwise RTT from project-latency's hub and auto-pick the best triple within a geo (or anchor + auto-pick).
+- **Adapter prefix-rewrite for tenant isolation** — buckets created via `/v1/me/buckets` are named `<tenant_id>__<name>` and you call them via that full name. Cleaner UX would have the adapter automatically rewrite `/v1/kv/<short>/<key>` → the prefixed name based on the bearer's tenant. Deferred.
 - **Latency-driven placement engine (#4)** — placement currently uses static `geo:` tags. Next: read pairwise RTT from project-latency's hub and auto-pick the best triple within a geo (or anchor + auto-pick).
 - **GTM cold-start latency** — first ~5 calls from fwf are 100-200ms; warm steady-state is 50-70ms server-side. Per your note, it'll improve with bake time. Will re-baseline tomorrow.
 - **`ap-southeast` (Sydney) classified as `geo:ap`** in the adapter's `geoOfRegion` (matches "ap-" prefix) — strictly should be `geo:oc`. Cosmetic; revisit if we add OC-specific placements.
@@ -68,10 +68,14 @@ adapter v0.1.6 → v0.1.8
   + /v1/admin/buckets returns full topology (replicas, leader, peers, lag, placement_tags)
   + /v1/admin/buckets discovers mirror streams (KV_<bucket>_mirror_*) and reports per-mirror lag
 
-control v0.1.5 (no change tonight; the v0.1.5 from earlier with /v1/internal/keys stays)
+control v0.1.5 → v0.1.7
+  + /v1/me           — user-key auth resolves to tenant info
+  + /v1/me/buckets   — list & POST create bucket; placement (geo) + auto-mirrors in other geos
+  + bucket naming: <tenant_id>__<name> (NATS forbids dots in bucket names)
 
 user spin app
   + /topology page (SVG world map, bucket polygons, leader rings, mirror dashed lines + lag table)
+  + /dash now has self-service bucket creation form
   + /play subject-wildcard fix (proxy was dropping query string)
   + nav now includes "topology"
 
