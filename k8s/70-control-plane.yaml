@@ -40,7 +40,7 @@ spec:
         - name: harbor-creds
       containers:
         - name: control
-          image: harbor.harbor.svc.cluster.local/presales/nats-kv-control:v0.1.9
+          image: harbor.harbor.svc.cluster.local/presales/nats-kv-control:v0.1.10
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -55,6 +55,10 @@ spec:
             - { name: NATS_URL,        value: "nats://kv-adapter.demo-nats-kv.svc.cluster.local:4222" }
             - { name: DB_PATH,         value: "/var/lib/nats-kv-control/control.db" }
             - { name: PUBLIC_BASE_URL, value: "https://3c5be533-8e6d-423b-9962-87d9da8d16cd.fwf.app" }
+            # Placement engine — pulls live RTT matrix from project-latency hub.
+            # TODO: move LATENCY_AUTH_TOKEN to Vault (api/data/nats-kv/control) before any production posture.
+            - { name: LATENCY_HUB_URL, value: "https://latency.connected-cloud.io" }
+            - { name: LATENCY_AUTH_TOKEN, value: "f77702e5b9277f608abd30707239e1f9" }
           ports:
             - { name: http,  containerPort: 8088 }
             - { name: https, containerPort: 8443 }

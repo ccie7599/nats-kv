@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bapley/project-nats-kv/internal/placement"
 	"github.com/bapley/project-nats-kv/internal/tenant"
 	"github.com/nats-io/nats.go"
 )
@@ -19,10 +20,11 @@ type Server struct {
 	adminToken string // bearer required on /v1/admin/*
 	pubBaseURL string // for building claim URLs
 	js         nats.JetStreamContext
+	placer     *placement.Engine // nil disables auto-placement (falls back to NATS default)
 }
 
-func New(store *Store, adminToken, pubBaseURL string, js nats.JetStreamContext) *Server {
-	s := &Server{store: store, mux: http.NewServeMux(), adminToken: adminToken, pubBaseURL: strings.TrimRight(pubBaseURL, "/"), js: js}
+func New(store *Store, adminToken, pubBaseURL string, js nats.JetStreamContext, placer *placement.Engine) *Server {
+	s := &Server{store: store, mux: http.NewServeMux(), adminToken: adminToken, pubBaseURL: strings.TrimRight(pubBaseURL, "/"), js: js, placer: placer}
 	s.routes()
 	return s
 }
@@ -63,6 +65,47 @@ func (s *Server) routes() {
 	// User self-service — bearer = user API key
 	s.mux.HandleFunc("/v1/me", s.userOnly(s.meHandler))
 	s.mux.HandleFunc("/v1/me/buckets", s.userOnly(s.userBucketsHandler))
+
+	// Placement preview — open (no auth) so the dashboard can show the
+	// "what would auto pick?" panel before the user commits to creating a
+	// bucket. Read-only; doesn't touch JetStream.
+	s.mux.HandleFunc("/v1/placement/preview", s.placementPreviewHandler)
+}
+
+// placementPreviewHandler runs the placement engine without creating a bucket,
+// so the UI can render the latency-driven decision as a hover/preview before
+// the user clicks Create. Query params: replicas (default 3), anchor (default
+// us-ord), mode (default "anchor"). Uses the live RTT matrix.
+func (s *Server) placementPreviewHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if s.placer == nil {
+		writeJSON(w, 503, map[string]any{"error": "placement engine not configured"})
+		return
+	}
+	replicas := 3
+	if v := r.URL.Query().Get("replicas"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err == nil {
+			replicas = n
+		}
+	}
+	anchor := r.URL.Query().Get("anchor")
+	if anchor == "" {
+		anchor = "us-ord"
+	}
+	mode := r.URL.Query().Get("mode")
+	if mode == "" {
+		mode = "anchor"
+	}
+	d, err := s.placer.Pick(r.Context(), replicas, anchor, mode)
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, d)
 }
 
 // userOnly resolves the bearer token to a tenant; rejects if unknown.
@@ -104,7 +147,8 @@ func (s *Server) meHandler(w http.ResponseWriter, r *http.Request, t *tenant.Ten
 type createBucketReq struct {
 	Name      string `json:"name"`     // user-friendly; gets prefixed with tenant id
 	Replicas  int    `json:"replicas"` // 1/3/5
-	Geo       string `json:"geo"`      // na/eu/ap/sa/oc/auto — RAFT placement
+	Geo       string `json:"geo"`      // na/eu/ap/sa/oc | auto | anchor:<region> — RAFT placement
+	Anchor    string `json:"anchor,omitempty"` // hint to placement engine when geo=auto (e.g. "fr-par-2")
 	History   uint8  `json:"history"`  // KV history depth
 	NoMirrors bool   `json:"no_mirrors,omitempty"` // opt-OUT — by default we mirror to every region
 }
@@ -172,9 +216,18 @@ func (s *Server) createUserBucket(w http.ResponseWriter, r *http.Request, t *ten
 		Replicas:    req.Replicas,
 		Description: "tenant=" + t.ID + " name=" + req.Name,
 	}
-	if req.Geo != "auto" && req.Geo != "any" {
-		cfg.Placement = &nats.Placement{Tags: []string{"geo:" + req.Geo}}
+
+	// Resolve placement. Decision is non-nil when the engine ran (auto/anchor
+	// modes) and is returned in the response so the UI can render the "why."
+	decision, placementErr := s.resolvePlacement(r.Context(), &req)
+	if placementErr != nil {
+		writeJSON(w, 400, map[string]any{"error": placementErr.Error()})
+		return
 	}
+	if decision != nil && decision.PlacementTag != "" {
+		cfg.Placement = &nats.Placement{Tags: []string{decision.PlacementTag}}
+	}
+
 	kv, err := s.js.CreateKeyValue(cfg)
 	if err != nil {
 		writeJSON(w, 500, map[string]any{"error": "create bucket: " + err.Error()})
@@ -227,17 +280,78 @@ func (s *Server) createUserBucket(w http.ResponseWriter, r *http.Request, t *ten
 		}
 	}
 
-	s.store.Audit(r.Context(), t.ID, "bucket.create", "bucket", bucketName, req.Geo)
-	writeJSON(w, 200, map[string]any{
-		"bucket":     bucketName,
-		"replicas":   req.Replicas,
-		"geo":        req.Geo,
-		"history":    req.History,
-		"mirrors":    mirrors,
+	auditMsg := req.Geo
+	if decision != nil {
+		auditMsg = decision.Mode + ":" + decision.ChosenGeo
+	}
+	s.store.Audit(r.Context(), t.ID, "bucket.create", "bucket", bucketName, auditMsg)
+
+	resp := map[string]any{
+		"bucket":       bucketName,
+		"replicas":     req.Replicas,
+		"geo":          req.Geo,
+		"history":      req.History,
+		"mirrors":      mirrors,
 		"mirror_count": len(mirrors),
-		"endpoint":   "https://edge.nats-kv.connected-cloud.io",
-		"sample_url": "https://edge.nats-kv.connected-cloud.io/v1/kv/" + bucketName + "/<key>",
-	})
+		"endpoint":     "https://edge.nats-kv.connected-cloud.io",
+		"sample_url":   "https://edge.nats-kv.connected-cloud.io/v1/kv/" + bucketName + "/<key>",
+	}
+	if decision != nil {
+		resp["placement"] = decision
+	}
+	writeJSON(w, 200, resp)
+}
+
+// resolvePlacement reads the createBucketReq's geo/anchor fields and produces
+// the placement Decision the bucket should use. Returns (nil, nil) for legacy
+// "manual" geo modes (na/eu/ap/sa/oc/any) so callers fall back to the simple
+// "geo:<x>" tag — the engine's only purpose is to decide *which* geo when the
+// caller doesn't know.
+func (s *Server) resolvePlacement(ctx context.Context, req *createBucketReq) (*placement.Decision, error) {
+	geo := strings.TrimSpace(req.Geo)
+	mode := ""
+	anchor := strings.TrimSpace(req.Anchor)
+	anchorSrc := "request"
+
+	switch {
+	case geo == "auto":
+		mode = "auto"
+		if anchor == "" {
+			anchor = "us-ord" // control plane lives here; reasonable default
+			anchorSrc = "default-control-plane"
+		}
+	case strings.HasPrefix(geo, "anchor:"):
+		mode = "anchor"
+		anchor = strings.TrimPrefix(geo, "anchor:")
+		if anchor == "" {
+			return nil, errors.New("anchor:<region> requires a region")
+		}
+		anchorSrc = "request-geo-anchor"
+	default:
+		// Manual geo (na/eu/ap/...) or "any". Skip the engine.
+		if geo != "" && geo != "any" {
+			return &placement.Decision{
+				Mode:         "manual",
+				Replicas:     req.Replicas,
+				ChosenGeo:    geo,
+				PlacementTag: "geo:" + geo,
+				GeneratedAt:  time.Now(),
+				Notes:        []string{"manual geo selection — engine bypassed"},
+			}, nil
+		}
+		return nil, nil
+	}
+
+	if s.placer == nil {
+		return nil, errors.New("placement engine not configured (LATENCY_HUB_URL unset?)")
+	}
+
+	d, err := s.placer.Pick(ctx, req.Replicas, anchor, mode)
+	if err != nil {
+		return nil, err
+	}
+	d.AnchorSource = anchorSrc
+	return d, nil
 }
 
 // streamRegions returns the set of region IDs that already host a replica

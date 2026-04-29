@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/bapley/project-nats-kv/internal/control"
+	"github.com/bapley/project-nats-kv/internal/placement"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/nats-io/nats.go"
 )
@@ -25,6 +26,8 @@ func main() {
 	dbPath := envOr("DB_PATH", "/var/lib/nats-kv-control/control.db")
 	adminToken := os.Getenv("ADMIN_TOKEN")
 	pubBaseURL := envOr("PUBLIC_BASE_URL", "https://nats-kv-demo.connected-cloud.io")
+	latencyHubURL := envOr("LATENCY_HUB_URL", "https://latency.connected-cloud.io")
+	latencyAuthToken := os.Getenv("LATENCY_AUTH_TOKEN")
 
 	if adminToken == "" {
 		log.Fatal("ADMIN_TOKEN env var required")
@@ -60,7 +63,15 @@ func main() {
 		log.Fatalf("store init: %v", err)
 	}
 
-	srv := control.New(store, adminToken, pubBaseURL, js)
+	var placer *placement.Engine
+	if latencyHubURL != "" {
+		placer = placement.NewEngine(placement.NewClient(latencyHubURL, latencyAuthToken))
+		log.Printf("placement engine: latency hub %s (auth=%v)", latencyHubURL, latencyAuthToken != "")
+	} else {
+		log.Print("placement engine: disabled (LATENCY_HUB_URL empty)")
+	}
+
+	srv := control.New(store, adminToken, pubBaseURL, js, placer)
 
 	httpSrv := &http.Server{
 		Addr:              listen,
