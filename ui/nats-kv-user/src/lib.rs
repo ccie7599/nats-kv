@@ -26,6 +26,20 @@ async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
     if path == "/docs" || path == "/docs/" {
         return html(DOCS_HTML);
     }
+    if path == "/loadtest" || path == "/loadtest/" {
+        return html(LOADTEST_HTML);
+    }
+    if path == "/api-explorer" || path == "/api-explorer/" {
+        return html(API_EXPLORER_HTML);
+    }
+    if path == "/openapi.yaml" {
+        return Ok(Response::builder()
+            .status(200)
+            .header("content-type", "application/yaml")
+            .header("access-control-allow-origin", "*")
+            .body(OPENAPI_YAML.to_string())
+            .build());
+    }
     if path.starts_with("/claim/") {
         return html(CLAIM_HTML);
     }
@@ -348,7 +362,9 @@ function renderNav(active) {
       <a href="/play" ${active==='play'?'style="text-decoration:underline"':''}>playground</a>
       <a href="/topology" ${active==='topology'?'style="text-decoration:underline"':''}>topology</a>
       <a href="/dash" ${active==='dash'?'style="text-decoration:underline"':''}>dashboard</a>
+      <a href="/loadtest" ${active==='loadtest'?'style="text-decoration:underline"':''}>load test</a>
       <a href="/docs" ${active==='docs'?'style="text-decoration:underline"':''}>docs</a>
+      <a href="/api-explorer" ${active==='api'?'style="text-decoration:underline"':''}>API</a>
       <span class="key-status ${k?'ok':''}">${k ? 'signed in: '+t+' • key '+k.slice(0,12)+'…' : 'no key (using shared demo)'}</span>
     </nav>
   `);
@@ -1211,7 +1227,8 @@ const DOCS_HTML: &str = r##"<!doctype html>
   <a href="#sample">6. Sample Spin function</a>
   <a href="#unique">7. NATS-unique features</a>
   <a href="#perf">8. Perf characteristics</a>
-  <a href="#caveats">9. Caveats &amp; status</a>
+  <a href="#throughput">9. Throughput (projected)</a>
+  <a href="#caveats">10. Caveats &amp; status</a>
 </aside>
 
 <h2 id="intro">1. What is this?</h2>
@@ -1234,7 +1251,9 @@ const DOCS_HTML: &str = r##"<!doctype html>
     <tr><td>Per-tenant isolation</td><td class="yes">✓ (per-app store)</td><td class="yes">✓ (tenant-prefixed buckets)</td></tr>
     <tr><td>Call shape from Spin</td><td>in-process WIT (no network)</td><td>HTTP via wasi-http (one network hop today; native crate possible later)</td></tr>
     <tr><td>Steady-state read latency from FWF (intra-CHI)</td><td>18-22ms</td><td>3-9ms (local mirror) / 25-50ms (cross-region depending on GTM mapping)</td></tr>
-    <tr><td>Production support / SLA</td><td class="yes">✓ (Akamai-managed)</td><td class="no">✗ (demo-grade — see §9)</td></tr>
+    <tr><td><b>Read throughput limit</b></td><td class="no">~1,000 reads/sec (FWF Spin KV gate)</td><td><b>~15-30k reads/sec per region</b> (projected, see §9)</td></tr>
+    <tr><td><b>Write throughput limit</b></td><td class="no">~100 writes/sec (FWF Spin KV gate)</td><td><b>~3-10k writes/sec per R3 bucket</b> (projected, see §9)</td></tr>
+    <tr><td>Production support / SLA</td><td class="yes">✓ (Akamai-managed)</td><td class="no">✗ (demo-grade — see §10)</td></tr>
   </tbody>
 </table>
 <p class="meta">The latency advantage flips both ways: NATS-KV is faster than Cosmos when the local mirror is reachable in one hop, and slower when GTM routes the function to a non-local NB (the in-process WIT path Cosmos uses has zero network cost).</p>
@@ -1425,7 +1444,51 @@ let resp: Response = send(req).await?;
 </table>
 <p class="meta">Numbers are <code>upstream_us</code> from the playground (FWF Spin function ⇄ adapter, excluding browser↔FWF). NATS-KV beats Cosmos when GTM lands the function on the same region as the bucket's RAFT leader. The FWF↔adapter network hop is the floor — would close to zero with a native <code>key-value-nats</code> Spin factor crate (in-process WIT call instead of HTTP).</p>
 
-<h2 id="caveats">9. Caveats &amp; status</h2>
+<h2 id="throughput">9. Throughput estimates <span class="meta" style="font-weight:normal;font-size:13px">— projected, NOT load-tested</span></h2>
+<div class="callout warn">
+  <b>These numbers are architecture-derived ceilings, not measured.</b> Per the project's scale-honesty rule, treat them as <i>"designed for"</i> not <i>"supports"</i>. The <a href="/loadtest">/loadtest</a> page lets you drive real traffic against any bucket and produce defensible measurements you can substitute in here.
+</div>
+
+<h3>Per-node ceiling (Linode <code>g8-dedicated-4-2</code>: 4 vCPU, 8GB RAM, ~1 Gbps NIC, ~1000 IOPS block volume)</h3>
+<table class="cmp">
+  <thead><tr><th>Path</th><th>Projected ceiling</th><th>Bottleneck</th></tr></thead>
+  <tbody>
+    <tr><td>Reads (local mirror, direct-get)</td><td><b>~15-30k reads/sec/node</b></td><td>HTTP/wasi-http parse + 4-core CPU; block-volume IOPS for cold keys (~1k/sec)</td></tr>
+    <tr><td>Writes — R1 source on this node</td><td><b>~15-25k writes/sec</b></td><td>WAL fsync to block volume; HTTP adapter overhead</td></tr>
+    <tr><td>Writes — R3 leader on this node</td><td><b>~3-10k writes/sec/bucket</b></td><td>Quorum wait (intra-geo ~30ms RTT)</td></tr>
+    <tr><td>Writes — R5 leader on this node</td><td><b>~2-7k writes/sec/bucket</b></td><td>Same as R3, plus extra ack</td></tr>
+  </tbody>
+</table>
+
+<h3>The hidden cap: mirror fan-out write amplification</h3>
+<p>Every write to an R3 source replicates to <b>24 mirrors</b>. Source's NIC budget is consumed by the fan-out:</p>
+<table class="cmp">
+  <thead><tr><th>Value size</th><th>Egress per write</th><th>NIC-bound write ceiling per source (1 Gbps)</th></tr></thead>
+  <tbody>
+    <tr><td>100 B</td><td>2.4 KB</td><td>~50,000 writes/sec</td></tr>
+    <tr><td>1 KB</td><td>24 KB</td><td>~5,000 writes/sec</td></tr>
+    <tr><td>10 KB</td><td>240 KB</td><td>~500 writes/sec</td></tr>
+    <tr><td>100 KB</td><td>2.4 MB</td><td>~50 writes/sec</td></tr>
+  </tbody>
+</table>
+<p class="meta">For most realistic workloads with 1KB+ values, the mirror fan-out is the binding constraint, not RAFT itself. <code>no_mirrors=true</code> on bucket creation removes this cap (at the cost of losing local-mirror reads everywhere).</p>
+
+<h3>Aggregate cluster throughput</h3>
+<table class="cmp">
+  <thead><tr><th>Workload</th><th>Aggregate projection</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Globally distributed reads (every region serves its locals from local mirror)</td><td><b>~400k-800k reads/sec total</b></td><td>27 nodes × 15-30k each, no contention — reads are fully parallel.</td></tr>
+    <tr><td>Writes, 3 R3 buckets one per geo (NA/EU/AP), 1 KB values</td><td><b>~9-15k writes/sec total</b></td><td>Each bucket's leader is its own throughput unit; mirror fan-out caps each at ~5k.</td></tr>
+    <tr><td>Writes, 10 R3 buckets across 3 geos, 1 KB values</td><td><b>~10-20k writes/sec total</b></td><td>Buckets sharing a geo share NIC budget for mirror egress.</td></tr>
+    <tr><td>Writes, single R1 bucket, 1 KB values, no mirrors</td><td><b>~15-25k writes/sec</b></td><td>One node's WAL fsync rate.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout note">
+  <b>For sales-grade numbers, run <a href="/loadtest">/loadtest</a></b> against your scenario and replace the projections above. The four scenarios most worth measuring: (1) single-region read throughput from one client, (2) R3 writes with <code>no_mirrors=true</code> isolating RAFT cost, (3) R3 writes with mirrors-everywhere measuring the mirror tax directly, (4) value-size sweep at fixed concurrency.
+</div>
+
+<h2 id="caveats">10. Caveats &amp; status</h2>
 <div class="callout warn">
   <b>This is a research POC, not a production service.</b> Built to explore what a richer KV substrate for Akamai Functions could look like, what the placement engineering tradeoffs feel like in practice, and how much performance is leaving the table when functions go through a network hop instead of in-process WIT. Treat numbers as illustrative.
 </div>
@@ -1445,4 +1508,590 @@ let resp: Response = send(req).await?;
 renderNav('docs');
 </script>
 </body></html>
+"##;
+
+// =====================================================================
+// /loadtest — browser-driven throughput probe.
+// Drives concurrent fetches against a chosen bucket, reports ops/sec,
+// p50/p95/p99 latency, error count. Two modes:
+//   • "via FWF" — what a Spin function would see (rate-limited by FWF
+//     instance fan-out; each call goes through wasi-http to the adapter).
+//   • "direct browser → adapter" — bypasses FWF entirely; CORS to the
+//     GTM-routed leaf. Ceiling is browser ↔ adapter network plus the
+//     adapter's per-node throughput limit (no Spin overhead).
+// =====================================================================
+const LOADTEST_HTML: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>NATS-KV — load test</title><style>__SHARED_CSS__
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:8px; }
+  .stat-box { padding:10px; border:1px solid #30363d; border-radius:4px; background:#0d1117; }
+  .stat-box .label { color:#8b949e; font-size:11px; text-transform:uppercase; letter-spacing:0.4px; }
+  .stat-box .value { font-size:24px; font-weight:600; margin-top:2px; }
+  .stat-box .value.ok { color:#3fb950; }
+  .stat-box .value.warn { color:#d29922; }
+  .stat-box .value.err { color:#f85149; }
+  .progress { height:6px; background:#21262d; border-radius:3px; overflow:hidden; margin-top:8px; }
+  .progress > div { height:100%; background:#58a6ff; transition:width 0.2s; }
+  table.run { width:100%; border-collapse:collapse; font-size:12px; margin-top:12px; }
+  table.run th, table.run td { padding:4px 8px; border-bottom:1px solid #30363d; text-align:right; }
+  table.run th { background:#161b22; text-align:right; }
+  table.run td:first-child, table.run th:first-child { text-align:left; }
+</style></head><body>
+<h1>Load test — drive throughput, get measured numbers</h1>
+<p class="sub">Browser-side concurrent fetch loop. Replaces the projected throughput in <a href="/docs#throughput">/docs §9</a> with measured numbers you can defend.</p>
+
+<div class="callout note" style="padding:10px; border-radius:4px; margin:12px 0; background:#0e2a3a; border:1px solid #1f6feb; font-size:13px;">
+  <b>What you're measuring:</b> in <i>FWF</i> mode, each fetch hits the user-app's Spin function which proxies to the adapter — exactly what a function-author's NATS-KV calls look like. In <i>direct</i> mode, the browser hits the adapter through GTM directly, bypassing FWF entirely. The gap between the two is the cost of the function-side wasi-http hop.
+</div>
+
+<fieldset>
+  <legend>Configure</legend>
+  <div class="row">
+    <div><label>bucket</label><select id="lt-bucket"></select></div>
+    <div><label>operation</label><select id="lt-op">
+      <option value="GET">GET</option>
+      <option value="PUT">PUT</option>
+      <option value="MIX">MIX (90% GET / 10% PUT)</option>
+    </select></div>
+    <div><label>path</label><select id="lt-path">
+      <option value="fwf">via FWF (Spin function)</option>
+      <option value="direct">direct browser → adapter (CORS)</option>
+    </select></div>
+  </div>
+  <div class="row">
+    <div><label>concurrency</label><input id="lt-conc" type="number" value="10" min="1" max="200"></div>
+    <div><label>duration (sec)</label><input id="lt-dur" type="number" value="10" min="1" max="120"></div>
+    <div><label>value size (bytes, PUTs)</label><select id="lt-vsize">
+      <option value="100">100 B</option>
+      <option value="1024" selected>1 KB</option>
+      <option value="10240">10 KB</option>
+    </select></div>
+    <div><label>keyspace</label><select id="lt-keyspace">
+      <option value="1">single key (worst case for cache contention)</option>
+      <option value="100" selected>100 keys</option>
+      <option value="10000">10,000 keys</option>
+    </select></div>
+  </div>
+  <div class="actions">
+    <button onclick="runLoad()" id="lt-run">Run</button>
+    <button onclick="stopLoad()" id="lt-stop" class="secondary" disabled>Stop</button>
+    <span id="lt-status" class="meta" style="margin-left:12px"></span>
+  </div>
+  <div class="progress"><div id="lt-progress" style="width:0%"></div></div>
+</fieldset>
+
+<fieldset>
+  <legend>Live results</legend>
+  <div class="grid">
+    <div class="stat-box"><div class="label">Throughput</div><div class="value" id="lt-rps">—</div><div class="label" style="margin-top:4px">ops / sec</div></div>
+    <div class="stat-box"><div class="label">Total ops</div><div class="value" id="lt-total">0</div></div>
+    <div class="stat-box"><div class="label">Errors</div><div class="value" id="lt-errs">0</div></div>
+    <div class="stat-box"><div class="label">p50 latency</div><div class="value" id="lt-p50">—</div><div class="label" style="margin-top:4px">ms</div></div>
+    <div class="stat-box"><div class="label">p95 latency</div><div class="value" id="lt-p95">—</div><div class="label" style="margin-top:4px">ms</div></div>
+    <div class="stat-box"><div class="label">p99 latency</div><div class="value" id="lt-p99">—</div><div class="label" style="margin-top:4px">ms</div></div>
+  </div>
+  <table class="run">
+    <thead><tr><th>elapsed</th><th>ops/sec</th><th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>errs</th></tr></thead>
+    <tbody id="lt-tick-body"></tbody>
+  </table>
+</fieldset>
+
+<fieldset>
+  <legend>History (this session)</legend>
+  <table class="run" id="lt-history">
+    <thead><tr><th>when</th><th>bucket</th><th>op</th><th>path</th><th>conc</th><th>dur</th><th>ops/sec</th><th>p50</th><th>p95</th><th>p99</th><th>errs</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</fieldset>
+
+<script>__NAV_JS__
+renderNav('loadtest');
+const $ = (id) => document.getElementById(id);
+
+const ALL_REGIONS = [
+  "us-ord","us-east","us-central","us-west","us-southeast","us-lax","us-mia","us-sea","ca-central","br-gru",
+  "gb-lon","eu-central","de-fra-2","fr-par-2","nl-ams","se-sto","it-mil",
+  "ap-south","sg-sin-2","ap-northeast","jp-tyo-3","jp-osa","ap-west","in-bom-2","in-maa","id-cgk","ap-southeast",
+];
+
+const ADAPTER_DIRECT_URL = "https://edge.nats-kv.connected-cloud.io";
+
+async function loadBuckets() {
+  const sel = $("lt-bucket");
+  const opts = [{name:"demo", label:"demo (shared, R3 NA, 27 mirrors)"}];
+  if (userKey()) {
+    try {
+      const r = await fetch("/api/control/v1/me/buckets", { headers: {"Authorization": "Bearer " + userKey()} });
+      if (r.ok) {
+        const j = await r.json();
+        for (const d of (j.details||[])) {
+          const short = d.name.includes("__") ? d.name.split("__").slice(1).join("__") : d.name;
+          opts.push({name: d.name, label: `${short} (R${d.replicas||1}, ${d.mirror_count||0} mirrors)`});
+        }
+      }
+    } catch (e) {}
+  }
+  sel.innerHTML = opts.map(o => `<option value="${o.name}">${o.label}</option>`).join("");
+}
+loadBuckets();
+
+let running = false;
+let stopRequested = false;
+
+function p(arr, q) {
+  if (arr.length === 0) return 0;
+  const sorted = [...arr].sort((a,b)=>a-b);
+  return sorted[Math.min(sorted.length-1, Math.floor(sorted.length * q))];
+}
+
+async function runLoad() {
+  if (running) return;
+  const bucket = $("lt-bucket").value;
+  const op = $("lt-op").value;
+  const conc = Math.max(1, parseInt($("lt-conc").value, 10));
+  const durMs = Math.max(1000, parseInt($("lt-dur").value, 10) * 1000);
+  const vsize = parseInt($("lt-vsize").value, 10);
+  const keyspace = parseInt($("lt-keyspace").value, 10);
+  const path = $("lt-path").value;
+  const valueBlob = "x".repeat(vsize);
+  const key = (i) => keyspace === 1 ? "lt-key" : `lt-${i % keyspace}`;
+  const buildUrl = (k) => path === "fwf"
+    ? `/api/nats/v1/kv/${encodeURIComponent(bucket)}/${encodeURIComponent(k)}`
+    : `${ADAPTER_DIRECT_URL}/v1/kv/${encodeURIComponent(bucket)}/${encodeURIComponent(k)}`;
+  const buildHeaders = () => {
+    const h = {};
+    if (path === "fwf") {
+      if (userKey()) h["X-KV-Key"] = userKey();
+    } else {
+      h["Authorization"] = "Bearer " + (userKey() || "akv_demo_open");
+    }
+    return h;
+  };
+
+  // reset UI
+  running = true; stopRequested = false;
+  $("lt-run").disabled = true; $("lt-stop").disabled = false;
+  $("lt-status").textContent = `running ${op} for ${durMs/1000}s @ concurrency ${conc} via ${path}…`;
+  $("lt-tick-body").innerHTML = "";
+  $("lt-rps").textContent = "—"; $("lt-total").textContent = 0; $("lt-errs").textContent = 0;
+  $("lt-p50").textContent = "—"; $("lt-p95").textContent = "—"; $("lt-p99").textContent = "—";
+
+  const t0 = performance.now();
+  const deadline = t0 + durMs;
+  let total = 0, errs = 0, opCounter = 0;
+  const lats = [];               // all latencies (full run)
+  const tickLats = [];           // per-tick latencies (cleared each tick)
+  let lastTick = t0, lastTickTotal = 0;
+
+  // Worker fires fetches as fast as it can until deadline.
+  async function worker(workerId) {
+    while (performance.now() < deadline && !stopRequested) {
+      const i = opCounter++;
+      const k = key(i);
+      const isPut = op === "PUT" || (op === "MIX" && (i % 10 === 0));
+      const opts = { method: isPut ? "PUT" : "GET", headers: buildHeaders() };
+      if (isPut) opts.body = valueBlob;
+      const t1 = performance.now();
+      try {
+        const r = await fetch(buildUrl(k), opts);
+        if (path === "fwf") {
+          // FWF wraps response; status inside envelope.
+          const j = await r.json();
+          if (j.status >= 400 && j.status !== 404) errs++;
+        } else {
+          // Direct adapter: 200/204/404 are all fine.
+          if (!r.ok && r.status !== 404) errs++;
+          await r.arrayBuffer(); // drain so connection can be reused
+        }
+        const dt = performance.now() - t1;
+        lats.push(dt);
+        tickLats.push(dt);
+        total++;
+      } catch (e) { errs++; }
+    }
+  }
+
+  // Stats ticker: updates UI every 500ms
+  const tickH = setInterval(() => {
+    const now = performance.now();
+    const elapsed = (now - t0) / 1000;
+    const tickElapsed = (now - lastTick) / 1000;
+    const tickOps = total - lastTickTotal;
+    const tickRps = tickElapsed > 0 ? tickOps / tickElapsed : 0;
+    $("lt-rps").textContent = tickRps.toFixed(0);
+    $("lt-total").textContent = total;
+    $("lt-errs").textContent = errs;
+    if (lats.length) {
+      $("lt-p50").textContent = p(lats, 0.50).toFixed(1);
+      $("lt-p95").textContent = p(lats, 0.95).toFixed(1);
+      $("lt-p99").textContent = p(lats, 0.99).toFixed(1);
+    }
+    $("lt-progress").style.width = Math.min(100, elapsed * 1000 / durMs * 100).toFixed(1) + "%";
+    if (tickLats.length) {
+      const tb = $("lt-tick-body");
+      const row = document.createElement("tr");
+      row.innerHTML = `<td>${elapsed.toFixed(1)}s</td><td>${tickRps.toFixed(0)}</td><td>${p(tickLats,0.5).toFixed(1)}</td><td>${p(tickLats,0.95).toFixed(1)}</td><td>${p(tickLats,0.99).toFixed(1)}</td><td>${errs}</td>`;
+      tb.appendChild(row);
+      while (tb.children.length > 30) tb.removeChild(tb.firstChild);
+    }
+    tickLats.length = 0;
+    lastTick = now; lastTickTotal = total;
+  }, 500);
+
+  // Spin up workers in parallel
+  const workers = [];
+  for (let w = 0; w < conc; w++) workers.push(worker(w));
+  await Promise.all(workers);
+  clearInterval(tickH);
+
+  const totalElapsed = (performance.now() - t0) / 1000;
+  const finalRps = total / totalElapsed;
+  $("lt-rps").textContent = finalRps.toFixed(0);
+  $("lt-total").textContent = total;
+  $("lt-errs").textContent = errs;
+  if (lats.length) {
+    $("lt-p50").textContent = p(lats, 0.50).toFixed(1);
+    $("lt-p95").textContent = p(lats, 0.95).toFixed(1);
+    $("lt-p99").textContent = p(lats, 0.99).toFixed(1);
+  }
+  $("lt-status").textContent = `done — ${total} ops in ${totalElapsed.toFixed(1)}s @ ${finalRps.toFixed(0)} ops/sec (${errs} errors)`;
+  $("lt-run").disabled = false; $("lt-stop").disabled = true;
+  running = false;
+
+  // history row
+  const histBody = $("lt-history").querySelector("tbody");
+  const histRow = document.createElement("tr");
+  histRow.innerHTML = `<td>${new Date().toLocaleTimeString()}</td><td>${bucket}</td><td>${op}</td><td>${path}</td><td>${conc}</td><td>${(durMs/1000).toFixed(0)}s</td><td>${finalRps.toFixed(0)}</td><td>${lats.length?p(lats,0.5).toFixed(1):'—'}</td><td>${lats.length?p(lats,0.95).toFixed(1):'—'}</td><td>${lats.length?p(lats,0.99).toFixed(1):'—'}</td><td>${errs}</td>`;
+  histBody.insertBefore(histRow, histBody.firstChild);
+}
+
+function stopLoad() {
+  stopRequested = true;
+  $("lt-status").textContent = "stop requested…";
+}
+</script>
+</body></html>
+"##;
+
+// =====================================================================
+// /api-explorer — Swagger UI loaded from CDN, pointed at /openapi.yaml.
+// Lets users explore + execute every endpoint interactively without
+// crafting curl by hand.
+// =====================================================================
+const API_EXPLORER_HTML: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>NATS-KV — API explorer</title>
+<link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
+<style>__SHARED_CSS__
+  /* swagger-ui has its own theme; just give it a frame */
+  #swagger-ui { background:#fff; border-radius:6px; min-height:400px; }
+</style></head><body>
+<h1>API explorer</h1>
+<p class="sub">Interactive Swagger UI for the NATS-KV data plane and control plane. Authorize once with your bearer token and run any endpoint live.</p>
+<div id="swagger-ui"></div>
+<script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-standalone-preset.js"></script>
+<script>__NAV_JS__
+renderNav('api');
+window.onload = () => {
+  window.ui = SwaggerUIBundle({
+    url: "/openapi.yaml",
+    dom_id: "#swagger-ui",
+    presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
+    layout: "BaseLayout",
+    deepLinking: true,
+    persistAuthorization: true,
+  });
+};
+</script>
+</body></html>
+"##;
+
+// =====================================================================
+// /openapi.yaml — OpenAPI 3.0 spec for both planes.
+// Hand-maintained (small enough surface). Server URLs match the live
+// production endpoints; "Authorize" in Swagger UI sets the bearer.
+// =====================================================================
+const OPENAPI_YAML: &str = r##"openapi: 3.0.3
+info:
+  title: NATS-KV for Akamai Functions
+  description: |
+    Globally distributed NATS JetStream KV with HTTP API, fronted by GTM
+    across 27 regions. Demo-grade research POC — see /docs for status,
+    architecture, and Cosmos comparison.
+  version: 0.2.5
+servers:
+  - url: https://edge.nats-kv.connected-cloud.io
+    description: Data plane (GTM-routed to nearest of 27 regions)
+  - url: https://cp.nats-kv.connected-cloud.io
+    description: Control plane (LZ only — tenants, buckets, placement)
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Per-tenant API key minted via the admin app's invite → claim flow.
+        For the open demo, use `akv_demo_open` (read/write to the shared `demo` bucket).
+  schemas:
+    PutResponse:
+      type: object
+      properties:
+        revision:
+          type: integer
+          format: int64
+          example: 42
+    HistoryEntry:
+      type: object
+      properties:
+        revision: { type: integer, format: int64 }
+        value_b64: { type: string }
+        created: { type: string, format: date-time }
+    KeysResponse:
+      type: object
+      properties:
+        keys:
+          type: array
+          items: { type: string }
+    BucketSummary:
+      type: object
+      properties:
+        name: { type: string }
+        replicas: { type: integer }
+        peers:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              role: { type: string, enum: [leader, replica] }
+              current: { type: boolean }
+        mirrors:
+          type: array
+          items: { type: object }
+    PlacementDecision:
+      type: object
+      properties:
+        mode: { type: string, enum: [auto, anchor, manual] }
+        replicas: { type: integer }
+        anchor: { type: string, example: us-ord }
+        chosen_geo: { type: string, example: na }
+        chosen_regions:
+          type: array
+          items: { type: string }
+          description: predicted top-k regions by RTT-from-anchor
+        actual_regions:
+          type: array
+          items: { type: string }
+          description: regions JetStream actually placed on (may differ from chosen)
+        write_latency_ms: { type: number, format: double }
+        quorum_edge_ms: { type: number, format: double }
+        notes:
+          type: array
+          items: { type: string }
+    CreateBucketRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, example: sessions }
+        replicas: { type: integer, enum: [1, 3, 5], default: 3 }
+        geo:
+          type: string
+          description: 'auto | anchor:&lt;region&gt; | na | eu | ap | sa'
+          default: auto
+        anchor: { type: string, description: 'hint for auto mode (default us-ord)' }
+        history: { type: integer, default: 8, description: 'revisions to keep per key' }
+        no_mirrors: { type: boolean, default: false }
+paths:
+  /v1/health:
+    get:
+      summary: Liveness probe
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  region: { type: string, example: us-ord }
+  /v1/kv/{bucket}/{key}:
+    get:
+      summary: Read latest value
+      parameters:
+        - { in: path, name: bucket, required: true, schema: { type: string } }
+        - { in: path, name: key,    required: true, schema: { type: string } }
+        - { in: query, name: revision, required: false, schema: { type: integer, format: int64 }, description: 'specific historical revision' }
+      responses:
+        '200':
+          description: value bytes; X-Revision header carries the revision
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '404': { description: not found }
+    put:
+      summary: Write
+      parameters:
+        - { in: path, name: bucket, required: true, schema: { type: string } }
+        - { in: path, name: key,    required: true, schema: { type: string } }
+        - { in: header, name: If-Match,      required: false, schema: { type: integer }, description: 'CAS — only write if current revision matches' }
+        - { in: header, name: If-None-Match, required: false, schema: { type: string },  description: 'set to * to create-if-absent' }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '200':
+          description: written
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PutResponse' }
+        '412': { description: CAS mismatch }
+    delete:
+      summary: Tombstone the key
+      parameters:
+        - { in: path, name: bucket, required: true, schema: { type: string } }
+        - { in: path, name: key,    required: true, schema: { type: string } }
+        - { in: header, name: If-Match, required: false, schema: { type: integer } }
+      responses:
+        '200': { description: deleted }
+        '412': { description: CAS mismatch }
+  /v1/kv/{bucket}/{key}/history:
+    get:
+      summary: All retained revisions of a key
+      parameters:
+        - { in: path, name: bucket, required: true, schema: { type: string } }
+        - { in: path, name: key,    required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: array of HistoryEntry
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/HistoryEntry' }
+  /v1/kv/{bucket}/{key}/incr:
+    post:
+      summary: Atomic counter (NATS-only)
+      parameters:
+        - { in: path, name: bucket, required: true, schema: { type: string } }
+        - { in: path, name: key,    required: true, schema: { type: string } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                by: { type: integer, default: 1 }
+      responses:
+        '200':
+          description: new value (atomic, CAS-loop server-side)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  value: { type: integer, format: int64 }
+                  revision: { type: integer, format: int64 }
+  /v1/kv/{bucket}/keys:
+    get:
+      summary: List keys matching a NATS subject pattern (NATS-only)
+      parameters:
+        - { in: path, name: bucket, required: true, schema: { type: string } }
+        - { in: query, name: match, required: true, schema: { type: string }, example: 'users.*.session' }
+      responses:
+        '200':
+          description: matching keys
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KeysResponse' }
+  /v1/admin/buckets:
+    get:
+      summary: List every bucket on the cluster
+      responses:
+        '200':
+          description: bucket list with placement, peers, mirror count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  buckets:
+                    type: array
+                    items: { $ref: '#/components/schemas/BucketSummary' }
+                  served_by: { type: string, example: kv-us-ord }
+  /v1/admin/cluster:
+    get:
+      summary: Identify which leaf served this request
+      responses:
+        '200':
+          description: this adapter's region + local mirror map
+  /v1/me:
+    get:
+      summary: Calling tenant's identity (control plane)
+      servers:
+        - { url: 'https://cp.nats-kv.connected-cloud.io' }
+      responses:
+        '200': { description: tenant info }
+  /v1/me/buckets:
+    get:
+      summary: Calling tenant's buckets, enriched (control plane)
+      servers:
+        - { url: 'https://cp.nats-kv.connected-cloud.io' }
+      responses:
+        '200':
+          description: buckets + per-bucket details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  buckets:
+                    type: array
+                    items: { type: string }
+                  details:
+                    type: array
+                    items: { $ref: '#/components/schemas/BucketSummary' }
+                  tenant_id: { type: string }
+    post:
+      summary: Create a bucket (control plane)
+      servers:
+        - { url: 'https://cp.nats-kv.connected-cloud.io' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateBucketRequest' }
+      responses:
+        '200':
+          description: created — response includes the placement Decision
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bucket: { type: string }
+                  replicas: { type: integer }
+                  mirror_count: { type: integer }
+                  placement: { $ref: '#/components/schemas/PlacementDecision' }
+  /v1/placement/preview:
+    get:
+      summary: Run the placement engine without creating a bucket (control plane)
+      servers:
+        - { url: 'https://cp.nats-kv.connected-cloud.io' }
+      security: []
+      parameters:
+        - { in: query, name: anchor,   required: false, schema: { type: string }, example: us-ord }
+        - { in: query, name: replicas, required: false, schema: { type: integer }, example: 3 }
+        - { in: query, name: mode,     required: false, schema: { type: string, enum: [auto, anchor] }, example: anchor }
+      responses:
+        '200':
+          description: placement Decision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlacementDecision' }
 "##;
