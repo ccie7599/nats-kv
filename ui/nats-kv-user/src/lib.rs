@@ -676,7 +676,9 @@ async function loadBuckets() {
 const TOPOLOGY_HTML: &str = r##"<!doctype html>
 <html><head><meta charset="utf-8"><title>NATS-KV topology</title><style>__SHARED_CSS__
   svg { background:#0d1117; border:1px solid #30363d; border-radius:6px; display:block; margin:0 auto; }
-  .land { fill:#161b22; stroke:#21262d; stroke-width:0.5; }
+  .land { fill:#1c2128; stroke:#30363d; stroke-width:0.4; pointer-events:none; }
+  .graticule { stroke:#161b22; stroke-width:0.3; fill:none; pointer-events:none; }
+  .sphere { fill:#0d1117; stroke:#30363d; stroke-width:0.5; pointer-events:none; }
   .grid { stroke:#21262d; stroke-width:0.5; fill:none; }
   .region-dot { fill:#30363d; stroke:#8b949e; stroke-width:0.5; }
   .region-dot.has-bucket { fill:#58a6ff; }
@@ -718,12 +720,10 @@ const TOPOLOGY_HTML: &str = r##"<!doctype html>
 
 <svg id="map" viewBox="0 0 1000 500" width="100%" preserveAspectRatio="xMidYMid meet">
   <defs>
-    <pattern id="grid" width="50" height="50" patternUnits="userSpaceOnUse">
-      <path d="M 50 0 L 0 0 0 50" class="grid"/>
-    </pattern>
     <radialGradient id="leader-glow"><stop offset="0%" stop-color="#3fb950" stop-opacity="0.6"/><stop offset="100%" stop-color="#3fb950" stop-opacity="0"/></radialGradient>
   </defs>
-  <rect width="1000" height="500" fill="url(#grid)"/>
+  <g id="graticule"></g>
+  <g id="land"></g>
   <g id="dots"></g>
   <g id="overlay"></g>
   <g id="labels"></g>
@@ -734,8 +734,39 @@ const TOPOLOGY_HTML: &str = r##"<!doctype html>
   <div id="detail-out"></div>
 </fieldset>
 
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<script src="https://cdn.jsdelivr.net/npm/topojson-client@3"></script>
 <script>__NAV_JS__
 renderNav('topology');
+
+// Equirectangular projection that *matches* the hand-rolled proj() below:
+//   x = (lon + 180) / 360 * 1000   ⇒  d3 scale = 1000 / (2π), translate = [500, 250]
+//   y = (90  - lat) / 180 * 500
+// Country paths therefore line up exactly with the region dots.
+async function drawWorld() {
+  if (typeof d3 === "undefined" || typeof topojson === "undefined") return;
+  const projection = d3.geoEquirectangular()
+    .scale(1000 / (2 * Math.PI))
+    .translate([500, 250]);
+  const path = d3.geoPath(projection);
+  // 15° graticule for subtle dark-theme polish.
+  const graticule = d3.geoGraticule().step([15, 15]);
+  document.getElementById("graticule").innerHTML =
+    `<path class="graticule" d="${path(graticule())}"/>`;
+  try {
+    const r = await fetch("https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json");
+    const world = await r.json();
+    const countries = topojson.feature(world, world.objects.countries);
+    const g = document.getElementById("land");
+    g.innerHTML = countries.features
+      .map(f => `<path class="land" d="${path(f)}"/>`)
+      .join("");
+  } catch (e) {
+    console.warn("world-atlas load failed; topology page will render without coastlines", e);
+  }
+}
+drawWorld();
+
 const REGIONS = {
   "us-ord":       { lat: 41.8781,  lon: -87.6298,  geo: "na" },
   "us-east":      { lat: 40.7357,  lon: -74.1724,  geo: "na" },
