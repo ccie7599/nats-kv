@@ -210,3 +210,18 @@ Property names match primary hostnames per global CLAUDE.md convention. Three Ak
 
 ---
 
+## ADR-016 — Explicit full-mesh `NATS_ROUTES` on every node
+**Status**: Accepted (2026-04-29)
+
+**Context**: The 27-node cluster was nominally a flat mesh (each node had `cluster.routes` pointing only to `us-ord.nats-kv.connected-cloud.io:6222`). NATS gossip was supposed to discover the other 25 peers and dial them. In practice, leaves only had 4 routes — all to LZ. R3 stream placement across regions failed because a quorum couldn't form between peers that didn't actually have routes to each other. JS meta-RAFT showed `cluster_size: 27` (peers were known about) but no peer-to-peer dial-out happened.
+
+Suspected root cause: gossip-advertised peer addresses for the LZ pod were the pod's internal IP (10.2.0.x), which leaves either couldn't reach (different pod-network) or which conflicted with the latency-mesh NATS server's IP space in some clusters. Once leaves rejected the gossiped LZ address, the only known route stayed at the bootstrap one.
+
+**Decision**: Set `NATS_ROUTES` on every node (LZ deployment + 26 leaf DaemonSets) to the full comma-separated list of all 27 peer URLs (`nats-route://<region>.nats-kv.connected-cloud.io:6222` × 27). NATS dedups self-routes; each node ends up with ~104 routes (4 per peer). Result: R3 stream placement with `geo:` tags works deterministically.
+
+**Trade-off**: explicit-route lists need to be regenerated when nodes are added/removed. For 27 stable regions this is fine. If we scale dynamically later, switch to NATS gateway-based super-cluster topology (out of scope for now).
+
+**Companion**: each adapter now also publishes `Tags: [region:<id>, geo:<g>]` so JetStream `placement.tags` selectors work (`geo:na`, `geo:eu`, etc.) — see `cmd/adapter/main.go` `geoOfRegion()`.
+
+---
+
