@@ -38,7 +38,7 @@ spec:
       # Read DEMO_TOKEN from Vault-injected file at startup
       containers:
         - name: adapter
-          image: harbor.harbor.svc.cluster.local/presales/nats-kv-adapter:v0.1.4
+          image: harbor.harbor.svc.cluster.local/presales/nats-kv-adapter:v0.1.5
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -65,6 +65,12 @@ spec:
             # Leaves gossip-discover other peers via this seed.
             - name: NATS_ROUTES
               value: "nats-route://us-ord.nats-kv.connected-cloud.io:6222"
+            # Leaves dial us-ord.nats-kv.connected-cloud.io (NB IP). The LZ pod's
+            # default cluster_advertise is its pod IP (10.2.0.x) which leaves can't
+            # reach and which collides with the latency-mesh NATS in some clusters.
+            # Force advertise of the NB IP so gossip works.
+            - name: CLUSTER_ADVERTISE
+              value: "us-ord.nats-kv.connected-cloud.io:6222"
             # TLS — wildcard cert from cert-manager
             - name: LISTEN_TLS_ADDR
               value: ":8443"

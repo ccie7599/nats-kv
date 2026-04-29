@@ -44,9 +44,10 @@ func main() {
 		Tags:       []string{"region:" + region},
 		NoSigs:     true,
 		Cluster: natsserver.ClusterOpts{
-			Name: "nats-kv-mesh",
-			Host: "0.0.0.0",
-			Port: clusterPort,
+			Name:      "nats-kv-mesh",
+			Host:      "0.0.0.0",
+			Port:      clusterPort,
+			Advertise: envOr("CLUSTER_ADVERTISE", ""), // empty = NATS picks default; set on LZ to NB IP so leaves can dial back
 		},
 	}
 	if natsRoutes != "" {

@@ -33,7 +33,7 @@ spec:
         - name: harbor-creds
       containers:
         - name: adapter
-          image: harbor.connected-cloud.io/presales/nats-kv-adapter:v0.1.4
+          image: harbor.connected-cloud.io/presales/nats-kv-adapter:v0.1.5
           imagePullPolicy: IfNotPresent
           env:
             - name: REGION
