@@ -900,27 +900,41 @@ function selectBucket(i) {
     <div><strong>${b.name}</strong> <span class="pill ${repClass}">R${b.replicas||1}</span> ${(b.mirrors||[]).length ? `<span class="pill mirror">+${b.mirrors.length} mirrors</span>` : ''}</div>
     <div class="meta">cluster: ${b.cluster||'?'} · values: ${b.values||0} · bytes: ${b.bytes||0} · history: ${b.history||0}</div>
     <h3 style="font-size:13px; margin:12px 0 4px">RAFT replicas</h3>
+    <p class="meta" style="margin:0 0 4px;font-size:11px;">Lag = messages behind leader (0 when caught up). Last seen = ms since this peer's heartbeat — keeps the leader confident that a replica is alive even when no traffic is flowing.</p>
     <table style="width:100%; font-size:12px;">
-      <thead><tr><th style="text-align:left">Peer</th><th>Role</th><th>Current</th><th>Lag (ms)</th></tr></thead>
-      <tbody>${(b.peers||[]).map(p => `
-        <tr>
+      <thead><tr><th style="text-align:left">Peer</th><th>Role</th><th>Current</th><th>Lag (msgs)</th><th>Last seen (ms)</th></tr></thead>
+      <tbody>${(b.peers||[]).map(p => {
+        const lag = p.lag_ms || 0;            // misnamed by adapter; this is msgs-behind, not ms
+        const active = p.active;              // ms since last heartbeat — undefined for the leader (it's itself)
+        const lagCls = lag<1?'ok':lag<10?'warn':'err';
+        const actCls = active===undefined?'':active<500?'ok':active<5000?'warn':'err';
+        return `<tr>
           <td>${p.name}</td>
           <td>${p.role}</td>
           <td>${p.current ? '<span class="ok">✓</span>' : '<span class="err">✗</span>'}</td>
-          <td class="lag ${p.lag_ms<10?'ok':p.lag_ms<100?'warn':'err'}">${p.lag_ms||0}</td>
-        </tr>`).join("")}</tbody>
+          <td class="lag ${lagCls}">${lag}</td>
+          <td class="lag ${actCls}">${active===undefined?'(self)':active}</td>
+        </tr>`;
+      }).join("")}</tbody>
     </table>
     ${(b.mirrors||[]).length ? `
-    <h3 style="font-size:13px; margin:12px 0 4px">Async mirrors (read replicas)</h3>
+    <h3 style="font-size:13px; margin:12px 0 4px">Async mirrors (read replicas) <span class="meta" style="font-weight:normal;font-size:11px">— ${b.mirrors.length} of 27 regions</span></h3>
+    <p class="meta" style="margin:0 0 4px;font-size:11px;">Lag = messages this mirror is behind the source. Last seen = ms since last replication activity from the source.</p>
     <table style="width:100%; font-size:12px;">
-      <thead><tr><th style="text-align:left">Stream</th><th>Leader</th><th>Tags</th><th>Lag (msgs)</th></tr></thead>
-      <tbody>${(b.mirrors||[]).map(m => `
-        <tr>
+      <thead><tr><th style="text-align:left">Stream</th><th>Leader</th><th>Tags</th><th>Lag (msgs)</th><th>Last seen (ms)</th></tr></thead>
+      <tbody>${(b.mirrors||[]).map(m => {
+        const lag = m.lag_msgs || 0;
+        const active = m.active_ms;
+        const lagCls = lag<5?'ok':lag<50?'warn':'err';
+        const actCls = active===undefined?'':active<2000?'ok':active<10000?'warn':'err';
+        return `<tr>
           <td>${m.stream}</td>
           <td>${m.leader||'?'}</td>
           <td>${(m.placement_tags||[]).join(',')}</td>
-          <td class="lag ${m.lag_msgs<5?'ok':m.lag_msgs<50?'warn':'err'}">${m.lag_msgs||0}</td>
-        </tr>`).join("")}</tbody>
+          <td class="lag ${lagCls}">${lag}</td>
+          <td class="lag ${actCls}">${active===undefined?'—':active}</td>
+        </tr>`;
+      }).join("")}</tbody>
     </table>` : ''}
   `;
   document.getElementById("bucket-detail").style.display = "block";
