@@ -2,7 +2,7 @@ use spin_sdk::http::{IntoResponse, Method, Request, Response};
 use spin_sdk::http_component;
 use spin_sdk::key_value::Store;
 
-const ADAPTER_BASE: &str = "http://us-ord.nats-kv.connected-cloud.io:8080";
+const ADAPTER_BASE: &str = "http://us-ord.nats-kv.connected-cloud.io";
 const DEMO_TOKEN: &str = "akv_demo_open";
 
 #[http_component]

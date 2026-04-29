@@ -2,51 +2,84 @@
 
 Globally distributed NATS JetStream KV for Akamai Functions / Fermyon Spin.
 
-See `SCOPE.md` for the full architecture, `DECISIONS.md` for ADRs.
+See `SCOPE.md` for the architecture, `DECISIONS.md` for ADRs.
 
-## Status — v0.1.0 (initial MVP)
+## Status — v0.2.0 (LZ-native)
 
-Single-region deployment. Validates the architecture end-to-end before fanning out.
+Single-region, but now properly deployed via the org's standard pattern: Harbor for the image, Vault for the token, Argo CD for sync, Prometheus annotations for OTel scrape.
 
-| Component | URL | Status |
+| Component | URL | Backed by |
 |---|---|---|
-| Adapter (us-ord) | http://us-ord.nats-kv.connected-cloud.io:8080 | live |
-| Adapter (us-ord, by IP) | http://172.234.25.197:8080 | live |
-| Spin user app on FWF | https://3c5be533-8e6d-423b-9962-87d9da8d16cd.fwf.app | live |
-
-**Deviations from SCOPE.md** (deliberate v0.1 shortcuts):
-- Single Linode VM in us-ord (`g8-dedicated-4-2`), not LKE node pool. Reason: needed a registry-free deploy path for first MVP. Re-architect as LKE node pool once container-registry access is sorted.
-- HTTP only, no TLS. Will layer Caddy+Let's Encrypt or LKE Ingress in v0.2.
-- R1 single-node. Multi-region cluster mesh + R3/R5 placement engine pending.
-- Demo bearer token `akv_demo_open` is shared, no multi-tenancy yet.
-- No GTM property yet (single endpoint).
-- No Akamai Ion property — using raw fwf.app URL.
+| Spin user app on Akamai Functions | https://3c5be533-8e6d-423b-9962-87d9da8d16cd.fwf.app | FWF |
+| Adapter (us-ord) | http://us-ord.nats-kv.connected-cloud.io | LKE NodeBalancer 172.237.141.164 |
+| Image | `harbor.harbor.svc.cluster.local/presales/nats-kv-adapter:v0.1.0` | Harbor |
+| Argo Application | `argocd/nats-kv` | LZ Argo CD |
+| Vault secret | `api/nats-kv/config` (key `demo_token`) | LZ Vault |
 
 ## Quick test
 
 ```bash
 TOKEN=akv_demo_open
-URL=http://us-ord.nats-kv.connected-cloud.io:8080
+URL=http://us-ord.nats-kv.connected-cloud.io
 
-# Health
 curl -s $URL/v1/health
+curl -s -X PUT  -H "Authorization: Bearer $TOKEN" -d "hello" $URL/v1/kv/demo/greeting
+curl -s         -H "Authorization: Bearer $TOKEN"            $URL/v1/kv/demo/greeting
+curl -s -X POST -H "Authorization: Bearer $TOKEN"            $URL/v1/kv/demo/clicks/incr
+curl -s         -H "Authorization: Bearer $TOKEN"            $URL/v1/kv/demo/clicks/history
 
-# Put / Get
-curl -s -X PUT -H "Authorization: Bearer $TOKEN" -d "hello" $URL/v1/kv/demo/greeting
-curl -s    -H "Authorization: Bearer $TOKEN"            $URL/v1/kv/demo/greeting
-
-# Atomic increment (CAS-loop server-side)
-curl -s -X POST -H "Authorization: Bearer $TOKEN" $URL/v1/kv/demo/clicks/incr
-
-# Versioned history
-curl -s -H "Authorization: Bearer $TOKEN" $URL/v1/kv/demo/clicks/history
-
-# Subject-pattern key listing (NATS-unique)
 for u in alice bob carol; do
   curl -s -X PUT -H "Authorization: Bearer $TOKEN" -d "session-of-$u" \
     $URL/v1/kv/demo/users.$u.session > /dev/null
 done
 curl -s -H "Authorization: Bearer $TOKEN" "$URL/v1/kv/demo/keys?match=users.*.session"
+```
+
+## Deployment topology (v0.2)
+
+```
+                          ┌────────────────────────────────────┐
+                          │ Akamai Functions (Spin)            │
+                          │   nats-kv-user                     │
+                          │   https://3c5be533-…fwf.app        │
+                          └────────────────┬───────────────────┘
+                                           │  outbound HTTP (pooled)
+                                           ▼
+              ┌─────────────────────────────────────────────────┐
+              │ us-ord.nats-kv.connected-cloud.io               │
+              │   (Akamai Edge DNS A → NB 172.237.141.164)      │
+              └────────────────┬────────────────────────────────┘
+                                ▼
+              ┌─────────────────────────────────────────────────┐
+              │ LKE 575271 (presales-landing-zone, us-ord)      │
+              │   ns: demo-nats-kv                              │
+              │   Deployment kv-adapter (1 replica, PVC 50Gi)   │
+              │   Image: harbor/presales/nats-kv-adapter:v0.1.0 │
+              │   Vault Agent injects api/nats-kv/config        │
+              │   OTel scraped via prometheus.io/scrape=true    │
+              └─────────────────────────────────────────────────┘
+```
+
+## Build + deploy
+
+Manifests in `k8s/` are managed by Argo CD. Push to `main`, Argo syncs within ~30s.
+
+```bash
+# 1. Build adapter binary + image
+make build-linux
+docker build -f deploy/docker/Dockerfile -t harbor.connected-cloud.io/presales/nats-kv-adapter:vX.Y.Z .
+docker push harbor.connected-cloud.io/presales/nats-kv-adapter:vX.Y.Z
+
+# 2. Update k8s/40-deployment.yaml image tag, commit, push — Argo applies it.
+
+# 3. (One-time per cluster, before first Argo sync) clone harbor-creds into the namespace:
+KUBECONFIG=~/.kube/presales-landing-zone scripts/bootstrap-harbor-creds.sh
+
+# 4. (One-time) Apply the Argo Application:
+kubectl apply -f argo/application.yaml
+
+# Spin app:
+cd ui/nats-kv-user && spin build && spin aka deploy --no-confirm
 ```
 
 ## API surface (v0.1)
@@ -65,30 +98,25 @@ GET    /v1/kv/:bucket/keys                 # ?match=nats.subject.pattern
 
 All KV endpoints require `Authorization: Bearer <token>`. Responses include observability headers: `X-Served-By`, `X-Cluster-Geo`, `X-Revision`, `X-Latency-Ms`.
 
-## Build
+## Known gaps (deliberate v0.2 deferrals)
 
-```bash
-# Adapter
-go build -o bin/kv-adapter ./cmd/adapter
+- **Single region** — multi-region cluster mesh + R3/R5 placement engine pending. Will fan out to the 26 latency LKE clusters next.
+- **HTTP only** — TLS pending; cert-manager + Let's Encrypt with the Akamai DNS-01 solver per LZ standard.
+- **NodeBalancer** instead of `hostNetwork`+`hostPort` — single replica scales to ~10k req/s on `g8-dedicated-4-2`, fine for POC. Hostnet pivot when we move to the per-region single-node leaf clusters.
+- **NB firewall detached** — `demo-nb-fw` (3900446) does not include FWF Spin egress IPs in its allow-list, so FWF→adapter calls were rejected. NB is currently open. To re-attach: identify FWF egress CIDRs and add to the firewall rule, then `linode-cli firewalls device-create --id <NB_ID> --type nodebalancer 3900446`.
+- **Shared demo token** — multi-tenancy via NATS Accounts + control plane is the next major piece.
+- **No GTM** — single endpoint until multi-region.
 
-# Spin app
-cd ui/nats-kv-user && spin build && spin aka deploy --no-confirm
+## Repo layout
+
 ```
-
-## Local dev
-
-```bash
-REGION=local LISTEN_ADDR=:8080 NATS_CLIENT_PORT=14222 NATS_CLUSTER_PORT=16222 \
-  NATS_MONITOR_PORT=18222 JETSTREAM_DIR=/tmp/jstest \
-  ./bin/kv-adapter
+cmd/adapter/          Go HTTP+NATS adapter
+internal/adapter/     Server/handlers
+ui/nats-kv-user/      Spin app (Rust) for FWF
+k8s/                  Manifests synced by Argo CD
+argo/                 Argo Application CRDs (apply once per cluster)
+deploy/docker/        Dockerfile
+deploy/terraform/     Terraform module (legacy v0.1 bare-VM path; LKE manifests are the live path)
+docs/recipes/         CAS+TTL pattern recipes (lock, lease, leader-election, idempotency, rate-limit)
+scripts/              Bootstrap helpers (e.g. harbor-creds clone)
 ```
-
-## Roadmap
-
-See `SCOPE.md` exit criteria. Next priorities:
-1. Multi-region cluster mesh (NATS_ROUTES wiring, R3 default).
-2. LKE node pool migration once container registry is sorted.
-3. Placement engine with project-latency RTT data.
-4. Multi-tenancy (NATS Accounts + API key issuance).
-5. Admin Spin app with invite tokens.
-6. GTM property fronting all 27 regions.
