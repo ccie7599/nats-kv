@@ -123,6 +123,17 @@ const INDEX_HTML: &str = r##"<!doctype html>
   </fieldset>
 
   <fieldset>
+    <legend>Pending invite requests <span class="meta" id="pir-count"></span></legend>
+    <p class="meta" style="margin:0 0 8px">Visitors who hit the gated demo UI and submitted the "request invite" form. Click <b>Approve</b> to mint an invite, get a complete URL to send back to the requester, and mark the request fulfilled.</p>
+    <div class="actions">
+      <button class="secondary" onclick="loadInviteRequests('pending')">Refresh (pending)</button>
+      <button class="secondary" onclick="loadInviteRequests('')">All requests</button>
+    </div>
+    <table id="pir-tbl"><thead><tr><th>When</th><th>Name</th><th>Email</th><th>Reason</th><th>Status</th><th>Actions</th></tr></thead><tbody><tr><td colspan="6" class="meta">(click Refresh)</td></tr></tbody></table>
+    <div id="pir-out" style="margin-top:8px"></div>
+  </fieldset>
+
+  <fieldset>
     <legend>Outstanding invites</legend>
     <div class="actions">
       <button class="secondary" onclick="loadInvites(false)">Refresh (unclaimed)</button>
@@ -252,9 +263,93 @@ async function deleteTenant(id, tag) {
   loadTenants();
 }
 
+// ---- Pending invite requests ----
+async function loadInviteRequests(status) {
+  const qs = status ? "?status=" + encodeURIComponent(status) : "";
+  const r = await authFetch("v1/admin/invite-requests" + qs);
+  const j = await r.json();
+  const tb = $("pir-tbl").querySelector("tbody");
+  if (!r.ok) {
+    tb.innerHTML = '<tr><td colspan="6" class="err">' + (j.error || r.status) + '</td></tr>';
+    $("pir-count").textContent = "";
+    return;
+  }
+  const list = (j.requests || []).sort((a,b) => (b.created_at||"").localeCompare(a.created_at||""));
+  $("pir-count").textContent = list.length ? `(${list.length})` : "";
+  if (list.length === 0) {
+    tb.innerHTML = '<tr><td colspan="6" class="meta">(no requests)</td></tr>';
+    return;
+  }
+  tb.innerHTML = list.map(rq => {
+    const status = rq.status || "pending";
+    const statusEl = status === "pending" ? '<span class="warn">pending</span>'
+      : status === "approved" ? '<span class="ok">approved</span>'
+      : '<span class="err">declined</span>';
+    const actions = status === "pending"
+      ? `<button onclick="approveRequest('${rq.id}','${escapeHtml(rq.email)}')">Approve</button> <button class="warn" onclick="declineRequest('${rq.id}')">Decline</button>`
+      : (rq.invite_token ? `<span class="meta">→ ${rq.invite_token.slice(0,18)}…</span>` : '');
+    const reason = (rq.reason || "").length > 80 ? rq.reason.slice(0, 80) + "…" : (rq.reason || "");
+    return `<tr>
+      <td class="meta">${new Date(rq.created_at).toLocaleString()}</td>
+      <td>${escapeHtml(rq.name || "")}</td>
+      <td><span class="pill">${escapeHtml(rq.email || "")}</span></td>
+      <td class="meta" title="${escapeHtml(rq.reason || "")}">${escapeHtml(reason)}</td>
+      <td>${statusEl}</td>
+      <td class="actions-col">${actions}</td>
+    </tr>`;
+  }).join("");
+}
+
+function escapeHtml(s) {
+  return String(s||"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+// UI gate token used when building the share URL — pulled from a constant
+// shared with the user app's spin variable. Admin keeps a copy in localStorage
+// so they can rotate via `spin aka variables set ui_gate_token=...` and paste
+// the new value here. Default matches the user-app default.
+function uiGateToken() {
+  return localStorage.getItem("nats-kv-ui-gate") || "demo-open-2026";
+}
+
+async function approveRequest(id, email) {
+  if (!confirm("Approve invite request from " + email + "?\nMints a 7-day invite + access URL.")) return;
+  const r = await authFetch("v1/admin/invite-requests/" + encodeURIComponent(id) + "/approve", { method: "POST" });
+  const j = await r.json();
+  if (!r.ok) { alert("Failed: " + (j.error || r.status)); return; }
+  // Build a complete URL: include both the UI gate token (so the click bypasses the gate)
+  // AND the claim path. The user app's /claim/<token> flow already runs through the gate
+  // since /claim/* is in the public path whitelist, but we also append ?access= so they
+  // get the unlocked UI cookie set immediately on first click.
+  const userAppOrigin = "https://nats-kv.connected-cloud.io"; // production hostname (post-Akamai)
+  const fwfFallback = "https://3c5be533-8e6d-423b-9962-87d9da8d16cd.fwf.app"; // direct FWF (works today before Akamai property activates)
+  const claim = j.claim_path; // e.g. /claim/k_inv_abc123
+  const gate = encodeURIComponent(uiGateToken());
+  const akamaiUrl = `${userAppOrigin}${claim}?access=${gate}`;
+  const fwfUrl = `${fwfFallback}${claim}?access=${gate}`;
+  $("pir-out").innerHTML = `
+    <div style="padding:10px; border:1px solid #3fb950; border-radius:4px; background:#0e2a17;">
+      <b style="color:#3fb950">Approved.</b> Send this URL to the requester:
+      <div class="copy" style="margin-top:6px" onclick="navigator.clipboard.writeText('${akamaiUrl}')">${akamaiUrl}</div>
+      <div class="meta" style="margin-top:4px">Or via FWF direct (works pre-Akamai-property):</div>
+      <div class="copy" onclick="navigator.clipboard.writeText('${fwfUrl}')">${fwfUrl}</div>
+      <div class="meta" style="margin-top:4px">Click either to copy. Invite expires in 7 days.</div>
+    </div>`;
+  loadInviteRequests('pending');
+  loadInvites(false);
+}
+
+async function declineRequest(id) {
+  const note = prompt("Optional note (visible in audit log):") || "";
+  const r = await authFetch("v1/admin/invite-requests/" + encodeURIComponent(id) + "/decline" + (note ? "?note=" + encodeURIComponent(note) : ""), { method: "POST" });
+  if (!r.ok) { alert("Failed: " + r.status); return; }
+  loadInviteRequests('pending');
+}
+
 if (token()) {
   loadTenants();
   loadInvites(false);
+  loadInviteRequests('pending');
 }
 </script>
 </body>
