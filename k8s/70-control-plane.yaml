@@ -40,7 +40,7 @@ spec:
         - name: harbor-creds
       containers:
         - name: control
-          image: harbor.harbor.svc.cluster.local/presales/nats-kv-control:v0.1.13
+          image: harbor.harbor.svc.cluster.local/presales/nats-kv-control:v0.1.14
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:

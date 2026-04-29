@@ -16,7 +16,8 @@ type Decision struct {
 	Anchor          string      `json:"anchor"`           // region used as anchor
 	AnchorSource    string      `json:"anchor_source"`    // "request" | "default"
 	ChosenGeo       string      `json:"chosen_geo"`       // "na" | "eu" | "ap" | ...
-	ChosenRegions  []string     `json:"chosen_regions"`
+	ChosenRegions  []string     `json:"chosen_regions"`   // *predicted* regions (top-k by RTT from anchor); NATS may pick different members of the same geo
+	ActualRegions  []string     `json:"actual_regions,omitempty"` // populated post-create with the regions JetStream actually placed; differs from chosen_regions because placement.tags = [geo:<g>] is a coarse filter, not a per-region pin
 	PlacementTag    string      `json:"placement_tag"`    // value passed to JetStream Placement.Tags
 	WriteLatencyMs  float64     `json:"write_latency_ms"` // expected: anchor → leader + leader → quorum
 	QuorumEdgeMs    float64     `json:"quorum_edge_ms"`   // intra-set edge (leader → ceil(k/2)-th peer)

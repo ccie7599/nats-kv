@@ -286,22 +286,42 @@ func (s *Server) materializeBucket(bucketName string, replicas int, history uint
 	// source can't serve direct gets, which is the whole point of mirrors-
 	// everywhere. Update the source stream config to enable it.
 	srcStream := "KV_" + bucketName
-	if si, infoErr := s.js.StreamInfo(srcStream); infoErr == nil && si != nil && !si.Config.MirrorDirect {
-		patched := si.Config
-		patched.MirrorDirect = true
-		patched.AllowDirect = true
-		_, _ = s.js.UpdateStream(&patched)
+	if si, infoErr := s.js.StreamInfo(srcStream); infoErr == nil && si != nil {
+		if !si.Config.MirrorDirect {
+			patched := si.Config
+			patched.MirrorDirect = true
+			patched.AllowDirect = true
+			_, _ = s.js.UpdateStream(&patched)
+		}
+		// Record the actual placement so the UI can show what NATS chose vs
+		// what the engine predicted (placement.tags=[geo:<g>] is coarse).
+		if decision != nil && si.Cluster != nil {
+			actual := []string{}
+			if si.Cluster.Leader != "" {
+				actual = append(actual, strings.TrimPrefix(si.Cluster.Leader, "kv-"))
+			}
+			for _, p := range si.Cluster.Replicas {
+				actual = append(actual, strings.TrimPrefix(p.Name, "kv-"))
+			}
+			decision.ActualRegions = actual
+		}
 	}
 
 	mirrors := []string{}
 	if !withMirrors {
 		return mirrors, nil
 	}
-	raftRegions, _ := s.streamRegions(srcStream)
+	// Create a local-read mirror in *every* region — including the regions that
+	// host a RAFT replica of the source. The mirror is a separate stream, so
+	// having both the source replica and the mirror on the same node is fine
+	// (small extra disk per peer). This matters because the adapter's
+	// local-mirror-by-name read path (ADR-020) only fires when there's a
+	// `KV_<bucket>_mirror_<my-region>` stream to address. Skipping RAFT regions
+	// caused those nodes to fall back to direct-get-on-source, which NATS
+	// load-balances across the entire mirror fan-out — so reads from a node
+	// that *should* have local data sometimes landed in Asia. With mirrors
+	// everywhere, every region serves reads sub-ms.
 	for _, region := range allRegions {
-		if raftRegions[region] {
-			continue
-		}
 		mirrorName := srcStream + "_mirror_" + region
 		_, err := s.js.AddStream(&nats.StreamConfig{
 			Name:         mirrorName,

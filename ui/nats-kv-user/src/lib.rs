@@ -595,9 +595,22 @@ function renderPlacement(d) {
     return `<tr style="${winner?'font-weight:600':''}"><td style="padding:2px 8px"><span class="${cls}">${c.geo}</span>${winner?' ★':''}</td><td style="padding:2px 8px">${score}</td><td style="padding:2px 8px">${c.eligible?c.quorum_edge_ms.toFixed(1)+'ms':'—'}</td><td style="padding:2px 8px;font-size:11px">${regions}</td><td style="padding:2px 8px;font-size:11px;color:#8b949e">${c.reason||''}</td></tr>`;
   }).join("");
   const sampled = d.matrix_sampled_at ? new Date(d.matrix_sampled_at).toLocaleTimeString() : "—";
+  // Predicted vs actual: the engine's chosen_regions is the top-k by RTT from
+  // anchor. The placement tag we hand JetStream is just `geo:<g>`, so NATS
+  // picks 3-5 servers carrying that tag using its own load-balance — different
+  // members of the same geo, not necessarily our top-k. Show both when we
+  // have it.
+  const predicted = (d.chosen_regions||[]).join(", ");
+  const actual = (d.actual_regions||[]).join(", ");
+  let placementLine = `Winner: <span class="ok"><b>${d.chosen_geo}</b></span> · expected write ${d.write_latency_ms.toFixed(1)}ms · quorum edge ${d.quorum_edge_ms.toFixed(1)}ms`;
+  if (actual) {
+    placementLine += `<br><span class="meta">predicted regions: <code>${predicted}</code></span><br>actual regions: <code>${actual}</code> <span class="meta">(NATS picks within geo:${d.chosen_geo})</span>`;
+  } else {
+    placementLine += ` · regions <code>${predicted}</code>`;
+  }
   return `
-    <div style="margin-bottom:6px"><b>Auto-placement preview</b> · anchor <code>${d.anchor}</code> · R${d.replicas} · matrix sampled ${sampled}</div>
-    <div style="margin-bottom:6px">Winner: <span class="ok"><b>${d.chosen_geo}</b></span> · expected write ${d.write_latency_ms.toFixed(1)}ms · quorum edge ${d.quorum_edge_ms.toFixed(1)}ms · regions <code>${(d.chosen_regions||[]).join(", ")}</code></div>
+    <div style="margin-bottom:6px"><b>Auto-placement</b> · anchor <code>${d.anchor}</code> · R${d.replicas} · matrix sampled ${sampled}</div>
+    <div style="margin-bottom:6px">${placementLine}</div>
     <table style="width:100%; border-collapse:collapse; font-size:12px">
       <thead><tr style="border-bottom:1px solid #30363d"><th style="text-align:left;padding:2px 8px">geo</th><th style="text-align:left;padding:2px 8px">write</th><th style="text-align:left;padding:2px 8px">quorum edge</th><th style="text-align:left;padding:2px 8px">regions</th><th style="text-align:left;padding:2px 8px">reason</th></tr></thead>
       <tbody>${cands}</tbody>
