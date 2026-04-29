@@ -102,11 +102,23 @@ func (s *Server) meHandler(w http.ResponseWriter, r *http.Request, t *tenant.Ten
 }
 
 type createBucketReq struct {
-	Name        string `json:"name"`     // user-friendly; gets prefixed with tenant id
-	Replicas    int    `json:"replicas"` // 1/3/5
-	Geo         string `json:"geo"`      // na/eu/ap/sa/oc/auto
-	History     uint8  `json:"history"`  // KV history depth
-	WantMirrors bool   `json:"want_mirrors"`
+	Name      string `json:"name"`     // user-friendly; gets prefixed with tenant id
+	Replicas  int    `json:"replicas"` // 1/3/5
+	Geo       string `json:"geo"`      // na/eu/ap/sa/oc/auto — RAFT placement
+	History   uint8  `json:"history"`  // KV history depth
+	NoMirrors bool   `json:"no_mirrors,omitempty"` // opt-OUT — by default we mirror to every region
+}
+
+// allRegions: the 27 KV cluster peers, used to spread per-region read mirrors.
+// Kept in code (not derived) so the control plane doesn't depend on cluster
+// introspection at request time. Updated when new regions are added.
+var allRegions = []string{
+	"us-ord", "us-east", "us-central", "us-west", "us-southeast",
+	"us-lax", "us-mia", "us-sea", "ca-central", "br-gru",
+	"gb-lon", "eu-central", "de-fra-2", "fr-par-2", "nl-ams",
+	"se-sto", "it-mil",
+	"ap-south", "sg-sin-2", "ap-northeast", "jp-tyo-3", "jp-osa",
+	"ap-west", "in-bom-2", "in-maa", "id-cgk", "ap-southeast",
 }
 
 func (s *Server) userBucketsHandler(w http.ResponseWriter, r *http.Request, t *tenant.Tenant) {
@@ -170,24 +182,32 @@ func (s *Server) createUserBucket(w http.ResponseWriter, r *http.Request, t *ten
 	}
 	_ = kv
 
-	// Auto-create mirrors in the other geos for read-locality, if requested.
+	// Per-region read mirrors. Default: mirror to every region the RAFT replicas
+	// don't already cover, so reads are local everywhere on the planet
+	// (eventual consistency; lag visible in the topology UI). Opt-out via
+	// no_mirrors=true.
 	mirrors := []string{}
-	if req.WantMirrors && req.Replicas >= 1 {
-		mirrorGeos := []string{"na", "eu", "ap", "sa"}
-		for _, g := range mirrorGeos {
-			if g == req.Geo {
+	if !req.NoMirrors {
+		// Skip regions that already host a RAFT replica; we'd just be making
+		// JetStream confused / placement-conflicting if we tried.
+		raftRegions, err := s.streamRegions("KV_" + bucketName)
+		if err != nil {
+			s.store.Audit(r.Context(), t.ID, "bucket.create.warn", "bucket", bucketName, "raft regions: "+err.Error())
+		}
+		for _, region := range allRegions {
+			if raftRegions[region] {
 				continue
 			}
-			mirrorName := "KV_" + bucketName + "_mirror_" + g
+			mirrorName := "KV_" + bucketName + "_mirror_" + region
 			_, err := s.js.AddStream(&nats.StreamConfig{
-				Name:    mirrorName,
-				Mirror:  &nats.StreamSource{Name: "KV_" + bucketName},
-				Storage: nats.FileStorage,
-				Placement: &nats.Placement{Tags: []string{"geo:" + g}},
-				Replicas: 1,
-				AllowDirect: true,
+				Name:         mirrorName,
+				Mirror:       &nats.StreamSource{Name: "KV_" + bucketName},
+				Storage:      nats.FileStorage,
+				Placement:    &nats.Placement{Tags: []string{"region:" + region}},
+				Replicas:     1,
+				AllowDirect:  true,
 				MirrorDirect: true,
-				Duplicates: 2 * time.Minute,
+				Duplicates:   2 * time.Minute,
 			})
 			if err == nil {
 				mirrors = append(mirrors, mirrorName)
@@ -197,14 +217,34 @@ func (s *Server) createUserBucket(w http.ResponseWriter, r *http.Request, t *ten
 
 	s.store.Audit(r.Context(), t.ID, "bucket.create", "bucket", bucketName, req.Geo)
 	writeJSON(w, 200, map[string]any{
-		"bucket":   bucketName,
-		"replicas": req.Replicas,
-		"geo":      req.Geo,
-		"history":  req.History,
-		"mirrors":  mirrors,
-		"endpoint": "https://edge.nats-kv.connected-cloud.io",
+		"bucket":     bucketName,
+		"replicas":   req.Replicas,
+		"geo":        req.Geo,
+		"history":    req.History,
+		"mirrors":    mirrors,
+		"mirror_count": len(mirrors),
+		"endpoint":   "https://edge.nats-kv.connected-cloud.io",
 		"sample_url": "https://edge.nats-kv.connected-cloud.io/v1/kv/" + bucketName + "/<key>",
 	})
+}
+
+// streamRegions returns the set of region IDs that already host a replica
+// of the given stream. Used to avoid placing a mirror where the RAFT group
+// already lives.
+func (s *Server) streamRegions(streamName string) (map[string]bool, error) {
+	out := map[string]bool{}
+	info, err := s.js.StreamInfo(streamName)
+	if err != nil || info == nil || info.Cluster == nil {
+		return out, err
+	}
+	// Convert peer name "kv-<region>" → "<region>"
+	if info.Cluster.Leader != "" {
+		out[strings.TrimPrefix(info.Cluster.Leader, "kv-")] = true
+	}
+	for _, p := range info.Cluster.Replicas {
+		out[strings.TrimPrefix(p.Name, "kv-")] = true
+	}
+	return out, nil
 }
 
 func (s *Server) internalKeysHandler(w http.ResponseWriter, r *http.Request) {
