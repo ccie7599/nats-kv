@@ -1252,7 +1252,7 @@ const DOCS_HTML: &str = r##"<!doctype html>
     <tr><td>Call shape from Spin</td><td>in-process WIT (no network)</td><td>HTTP via wasi-http (one network hop today; native crate possible later)</td></tr>
     <tr><td>Steady-state read latency from FWF (intra-CHI)</td><td>18-22ms</td><td>3-9ms (local mirror) / 25-50ms (cross-region depending on GTM mapping)</td></tr>
     <tr><td><b>Read throughput limit</b></td><td class="no">~1,000 reads/sec (FWF Spin KV gate)</td><td><b>~15-30k reads/sec per region</b> (projected, see §9)</td></tr>
-    <tr><td><b>Write throughput limit</b></td><td class="no">~100 writes/sec (FWF Spin KV gate)</td><td><b>~3-10k writes/sec per R3 bucket</b> (projected, see §9)</td></tr>
+    <tr><td><b>Write throughput limit</b></td><td class="no">~100 writes/sec (FWF Spin KV gate)</td><td><b>~5-15k writes/sec per R3 bucket</b> (projected, see §9)</td></tr>
     <tr><td>Production support / SLA</td><td class="yes">✓ (Akamai-managed)</td><td class="no">✗ (demo-grade — see §10)</td></tr>
   </tbody>
 </table>
@@ -1449,38 +1449,38 @@ let resp: Response = send(req).await?;
   <b>These numbers are architecture-derived ceilings, not measured.</b> Per the project's scale-honesty rule, treat them as <i>"designed for"</i> not <i>"supports"</i>. The <a href="/loadtest">/loadtest</a> page lets you drive real traffic against any bucket and produce defensible measurements you can substitute in here.
 </div>
 
-<h3>Per-node ceiling (Linode <code>g8-dedicated-4-2</code>: 4 vCPU, 8GB RAM, ~1 Gbps NIC, ~1000 IOPS block volume)</h3>
+<h3>Per-node ceiling (Linode <code>g8-dedicated-4-2</code>: 4 vCPU, 8GB RAM, ~4-6 Gbps sustained NIC, block-volume storage)</h3>
 <table class="cmp">
   <thead><tr><th>Path</th><th>Projected ceiling</th><th>Bottleneck</th></tr></thead>
   <tbody>
-    <tr><td>Reads (local mirror, direct-get)</td><td><b>~15-30k reads/sec/node</b></td><td>HTTP/wasi-http parse + 4-core CPU; block-volume IOPS for cold keys (~1k/sec)</td></tr>
-    <tr><td>Writes — R1 source on this node</td><td><b>~15-25k writes/sec</b></td><td>WAL fsync to block volume; HTTP adapter overhead</td></tr>
-    <tr><td>Writes — R3 leader on this node</td><td><b>~3-10k writes/sec/bucket</b></td><td>Quorum wait (intra-geo ~30ms RTT)</td></tr>
-    <tr><td>Writes — R5 leader on this node</td><td><b>~2-7k writes/sec/bucket</b></td><td>Same as R3, plus extra ack</td></tr>
+    <tr><td>Reads (local mirror, direct-get)</td><td><b>~15-30k reads/sec/node</b></td><td>HTTP/wasi-http parse + 4-core CPU; for very cold keys, block-volume read IOPS</td></tr>
+    <tr><td>Writes — R1 source on this node</td><td><b>~20-30k writes/sec</b></td><td>WAL fsync (NATS batches well); HTTP adapter overhead</td></tr>
+    <tr><td>Writes — R3 leader on this node</td><td><b>~5-15k writes/sec/bucket</b></td><td>RAFT quorum wait (intra-geo ~30ms RTT) is the typical cap, not network</td></tr>
+    <tr><td>Writes — R5 leader on this node</td><td><b>~3-10k writes/sec/bucket</b></td><td>Same as R3, plus the third-fastest peer's RTT in the quorum path</td></tr>
   </tbody>
 </table>
 
-<h3>The hidden cap: mirror fan-out write amplification</h3>
-<p>Every write to an R3 source replicates to <b>24 mirrors</b>. Source's NIC budget is consumed by the fan-out:</p>
+<h3>Mirror fan-out write amplification (revised: Linode NICs sustain 4-6 Gbps, not 1)</h3>
+<p>Every write to an R3 source replicates to <b>24 mirrors</b>. Source's NIC budget is consumed by the fan-out — but Linode VMs sustain ~5 Gbps, so the fan-out tax is much less binding than the typical "1 Gbps NIC" assumption suggests:</p>
 <table class="cmp">
-  <thead><tr><th>Value size</th><th>Egress per write</th><th>NIC-bound write ceiling per source (1 Gbps)</th></tr></thead>
+  <thead><tr><th>Value size</th><th>Egress per write (24 mirrors)</th><th>NIC-bound ceiling per source (5 Gbps)</th><th>Effective ceiling (min of NIC, RAFT, IOPS)</th></tr></thead>
   <tbody>
-    <tr><td>100 B</td><td>2.4 KB</td><td>~50,000 writes/sec</td></tr>
-    <tr><td>1 KB</td><td>24 KB</td><td>~5,000 writes/sec</td></tr>
-    <tr><td>10 KB</td><td>240 KB</td><td>~500 writes/sec</td></tr>
-    <tr><td>100 KB</td><td>2.4 MB</td><td>~50 writes/sec</td></tr>
+    <tr><td>100 B</td><td>2.4 KB</td><td>~260,000 writes/sec</td><td><b>~10-15k</b> (RAFT-bound)</td></tr>
+    <tr><td>1 KB</td><td>24 KB</td><td>~26,000 writes/sec</td><td><b>~10-15k</b> (RAFT-bound)</td></tr>
+    <tr><td>10 KB</td><td>240 KB</td><td>~2,600 writes/sec</td><td><b>~2,500</b> (NIC-bound)</td></tr>
+    <tr><td>100 KB</td><td>2.4 MB</td><td>~260 writes/sec</td><td><b>~260</b> (NIC-bound)</td></tr>
   </tbody>
 </table>
-<p class="meta">For most realistic workloads with 1KB+ values, the mirror fan-out is the binding constraint, not RAFT itself. <code>no_mirrors=true</code> on bucket creation removes this cap (at the cost of losing local-mirror reads everywhere).</p>
+<p class="meta">For typical small-payload workloads (≤ a few KB) the binding constraint is <b>RAFT quorum cost</b>, not network — that flips at ~10 KB and above where NIC fan-out dominates. <code>no_mirrors=true</code> on bucket creation removes the fan-out entirely (at the cost of losing local-mirror reads everywhere). Earlier draft of this table assumed a 1 Gbps NIC and undercounted by ~5×.</p>
 
 <h3>Aggregate cluster throughput</h3>
 <table class="cmp">
   <thead><tr><th>Workload</th><th>Aggregate projection</th><th>Why</th></tr></thead>
   <tbody>
     <tr><td>Globally distributed reads (every region serves its locals from local mirror)</td><td><b>~400k-800k reads/sec total</b></td><td>27 nodes × 15-30k each, no contention — reads are fully parallel.</td></tr>
-    <tr><td>Writes, 3 R3 buckets one per geo (NA/EU/AP), 1 KB values</td><td><b>~9-15k writes/sec total</b></td><td>Each bucket's leader is its own throughput unit; mirror fan-out caps each at ~5k.</td></tr>
-    <tr><td>Writes, 10 R3 buckets across 3 geos, 1 KB values</td><td><b>~10-20k writes/sec total</b></td><td>Buckets sharing a geo share NIC budget for mirror egress.</td></tr>
-    <tr><td>Writes, single R1 bucket, 1 KB values, no mirrors</td><td><b>~15-25k writes/sec</b></td><td>One node's WAL fsync rate.</td></tr>
+    <tr><td>Writes, 3 R3 buckets one per geo (NA/EU/AP), 1 KB values</td><td><b>~15-45k writes/sec total</b></td><td>Each bucket's leader caps around 5-15k; three independent geos sum.</td></tr>
+    <tr><td>Writes, 10 R3 buckets evenly spread across 3 geos, 1 KB values</td><td><b>~30-80k writes/sec total</b></td><td>Each bucket = own RAFT leader, own throughput unit. NIC headroom (~26k/source at 1KB) leaves room to stack many sources per region.</td></tr>
+    <tr><td>Writes, single R1 bucket, 1 KB values, no mirrors</td><td><b>~20-30k writes/sec</b></td><td>One node's WAL fsync rate.</td></tr>
   </tbody>
 </table>
 
