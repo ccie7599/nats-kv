@@ -210,6 +210,31 @@ Property names match primary hostnames per global CLAUDE.md convention. Three Ak
 
 ---
 
+## ADR-017 — The 50ms KV-call gap to Cosmos is FWF-specific, not Spin/wasi-http
+**Status**: Documented (2026-04-29)
+
+**Context**: First-look benchmarks showed FWF Spin → our NATS adapter taking ~50ms per call vs. Cosmos's ~22ms via the same Spin app. Network ping FWF↔us-ord-NB is 0.3ms (intra-Chicago). Adapter internal time is sub-ms. Where's the 50ms going?
+
+**Investigation**: Ran identical Spin app locally on a Linode VM in the same Chicago metro (claudebot, 0.3ms ping to us-ord NB) via `spin up`. Numbers:
+- **Local Spin → wasi:http → us-ord NB (intra-DC)**: 1.7-2.4ms steady state (55ms only on first call for TLS handshake).
+- **Local Spin → spin:key-value WIT → in-process sqlite**: 0.06-0.15ms GET, ~2.5ms PUT (sqlite fsync).
+- **FWF Spin → wasi:http → us-ord NB**: 50-58ms steady state.
+- **FWF Spin → spin:key-value WIT → managed Cosmos**: 22ms steady state.
+
+**Decision/finding**: The ~50ms gap on FWF is a property of Akamai's managed Spin runtime, not Spin or wasi-http inherently. Self-hosted Spin in the same metro as the adapter delivers ~2ms — equivalent to in-process WIT for read paths.
+
+**Implications**:
+1. The "NATS-KV is slow vs. Cosmos" argument is FWF-platform-specific. Server-to-server clients (curl, sdks, native services) hit the adapter at ~5ms, not 50ms.
+2. A native `key-value-nats` factor crate (deferred, see ADR-001) remains the right long-term fix on FWF — moves the call from wasi-http to in-process WIT.
+3. We can demo true sub-5ms NATS-KV by deploying Spin ourselves (on LKE or a VM) alongside the adapter. The "self-hosted Spin" demo path is now a viable axis to compare against FWF.
+4. Worth raising with Fermyon/Akamai: the 50ms FWF-outbound-HTTP overhead applies to every Spin app calling external services, not just NATS. Could be platform-wide latency win to investigate.
+
+**Not changing yet**:
+- Adapter / GTM / cluster topology — all fine; perf is constrained by FWF's outbound layer.
+- Akamai property in front of `edge.nats-kv` (still deferred).
+
+---
+
 ## ADR-016 — Explicit full-mesh `NATS_ROUTES` on every node
 **Status**: Accepted (2026-04-29)
 
