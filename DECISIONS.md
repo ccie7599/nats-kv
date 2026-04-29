@@ -210,6 +210,35 @@ Property names match primary hostnames per global CLAUDE.md convention. Three Ak
 
 ---
 
+## ADR-018 — FWF wasi-http TLS handshake is the entire 50ms gap (intra-Chicago test)
+**Status**: Documented (2026-04-29)
+
+**Context**: ADR-017 said the 50ms gap was "FWF-specific, not Spin/wasi-http inherently" based on local-Spin benchmarks. Today we narrowed it further by deploying identical Spin app to FWF and probing three endpoint shapes from FWF, all in the same Chicago metro as FWF's egress IP (`172.239.46.208`):
+
+| Path from FWF Spin | Steady state | Notes |
+|---|---|---|
+| `http://<linode>:8888/` plain HTTP | **3.5ms** | Network/Spin floor on FWF; no TLS |
+| `https://<linode>:8443/` direct (no NB, valid LE cert) | **49ms** | TLS adds ~45ms over plain HTTP |
+| `https://us-ord-NB/` (existing adapter path) | **52-60ms** | NB adds 3-7ms over direct HTTPS |
+
+For comparison, a regular Chicago Linode VM (claudebot, sub-1ms ping to the probe) doing 5 sequential `curl https://...` calls (each a full TLS-1.3 handshake from scratch) completes in **5ms total**. FWF Spin doing the equivalent takes ~49ms — **10x slower than a standard TLS handshake on the same intra-DC network**.
+
+**Decision/finding**: The 50ms gap is concentrated in FWF's wasi-http TLS handshake path, not the network, NodeBalancer, adapter, NATS, or Spin/wasi-http inherently (local-`spin up` of the same app on a regular Chicago Linode hits the HTTPS probe in 5-10ms). Likely root causes (in priority order, for Fermyon to investigate):
+
+1. TLS session-ticket / 1-RTT resumption not actually working — every request pays handshake, despite TCP pool being warm.
+2. WASM-level crypto operations are slow in the FWF Spin runtime.
+3. An Akamai-side TLS-inspection proxy in the outbound path (would explain HTTP=fast, HTTPS=slow uniformly).
+
+**Implications**:
+1. NATS-KV's network/adapter is fully OK. The KV-vs-Cosmos perf gap is due to (a) Cosmos using `spin:key-value` WIT (in-process) vs. our `wasi-http` outbound, AND (b) FWF's HTTPS-specific overhead.
+2. Self-hosted Spin on LZ would deliver intra-Chicago HTTPS at 5-10ms, on par with Cosmos's 22ms.
+3. A native `key-value-nats` factor crate (ADR-001) bypasses wasi-http entirely — would close the gap fully on FWF.
+4. **Concrete bug report for Fermyon**: ship a Hello-world Spin app that does 100 GETs to the same HTTPS endpoint; observe each takes ~50ms. Compare to local `spin up`: each takes 2-5ms. That's the bug.
+
+**Probe still up at `172.236.104.189:8888` (HTTP) and `:8443` (HTTPS, valid wildcard cert).** Used by `/api/probe-claudebot` and `/api/probe-https` in the user app for re-tests.
+
+---
+
 ## ADR-017 — The 50ms KV-call gap to Cosmos is FWF-specific, not Spin/wasi-http
 **Status**: Documented (2026-04-29)
 

@@ -34,6 +34,48 @@ async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
             .build());
     }
 
+    // /api/probe-claudebot — call a plain-HTTP probe on a Chicago Linode (no TLS, no NB)
+    if path == "/api/probe-claudebot" {
+        let mut b = Request::builder();
+        b.method(Method::Get);
+        b.uri("http://172.236.104.189:8888/");
+        b.body(Vec::<u8>::new());
+        let t0 = std::time::Instant::now();
+        let upstream: Response = spin_sdk::http::send(b.build()).await?;
+        let elapsed_us = t0.elapsed().as_micros();
+        let body_b64 = b64encode(upstream.body());
+        let payload = format!(
+            r#"{{"upstream_us":{elapsed_us},"status":{},"body_b64":"{body_b64}"}}"#,
+            *upstream.status() as u16,
+        );
+        return Ok(Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(payload)
+            .build());
+    }
+
+    // /api/probe-https — same Chicago Linode but HTTPS with valid wildcard cert
+    if path == "/api/probe-https" {
+        let mut b = Request::builder();
+        b.method(Method::Get);
+        b.uri("https://probe.nats-kv.connected-cloud.io:8443/");
+        b.body(Vec::<u8>::new());
+        let t0 = std::time::Instant::now();
+        let upstream: Response = spin_sdk::http::send(b.build()).await?;
+        let elapsed_us = t0.elapsed().as_micros();
+        let body_b64 = b64encode(upstream.body());
+        let payload = format!(
+            r#"{{"upstream_us":{elapsed_us},"status":{},"body_b64":"{body_b64}"}}"#,
+            *upstream.status() as u16,
+        );
+        return Ok(Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(payload)
+            .build());
+    }
+
     // /api/whereami — Spin function calls an IP-echo service so we can see where
     // FWF is actually egressing from (FWF's outbound IP, geo).
     if path == "/api/whereami" {
