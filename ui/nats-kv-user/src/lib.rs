@@ -504,6 +504,15 @@ const DASH_HTML: &str = r##"<!doctype html>
 </fieldset>
 
 <script>__NAV_JS__
+// Regions list — kept in sync with internal/placement/geo.go AllRegions.
+// Declared up here (before any function call site) so populateAnchors()
+// doesn't hit a TDZ ReferenceError when the page-load block runs.
+const ALL_REGIONS = [
+  "us-ord","us-east","us-central","us-west","us-southeast","us-lax","us-mia","us-sea","ca-central","br-gru",
+  "gb-lon","eu-central","de-fra-2","fr-par-2","nl-ams","se-sto","it-mil",
+  "ap-south","sg-sin-2","ap-northeast","jp-tyo-3","jp-osa","ap-west","in-bom-2","in-maa","id-cgk","ap-southeast",
+];
+
 renderNav('dash');
 if (!userKey()) {
   document.getElementById("signed-out").style.display = "block";
@@ -522,12 +531,6 @@ async function loadMe() {
   document.getElementById("t-id").textContent = j.tenant_id || "(unknown)";
   document.getElementById("t-tag").textContent = j.tag || "(no tag)";
 }
-// Regions list — kept in sync with internal/placement/geo.go AllRegions.
-const ALL_REGIONS = [
-  "us-ord","us-east","us-central","us-west","us-southeast","us-lax","us-mia","us-sea","ca-central","br-gru",
-  "gb-lon","eu-central","de-fra-2","fr-par-2","nl-ams","se-sto","it-mil",
-  "ap-south","sg-sin-2","ap-northeast","jp-tyo-3","jp-osa","ap-west","in-bom-2","in-maa","id-cgk","ap-southeast",
-];
 
 function populateAnchors() {
   const sel = document.getElementById("b-anchor");
