@@ -18,10 +18,11 @@ type Server struct {
 	mux        *http.ServeMux
 	adminToken string // bearer required on /v1/admin/*
 	pubBaseURL string // for building claim URLs
+	js         nats.JetStreamContext
 }
 
-func New(store *Store, adminToken, pubBaseURL string) *Server {
-	s := &Server{store: store, mux: http.NewServeMux(), adminToken: adminToken, pubBaseURL: strings.TrimRight(pubBaseURL, "/")}
+func New(store *Store, adminToken, pubBaseURL string, js nats.JetStreamContext) *Server {
+	s := &Server{store: store, mux: http.NewServeMux(), adminToken: adminToken, pubBaseURL: strings.TrimRight(pubBaseURL, "/"), js: js}
 	s.routes()
 	return s
 }
@@ -58,6 +59,152 @@ func (s *Server) routes() {
 	// Internal — adapters poll for active key list. Open to all (returns hashes,
 	// not plaintexts; nodes share an L7 firewall envelope).
 	s.mux.HandleFunc("/v1/internal/keys", s.internalKeysHandler)
+
+	// User self-service — bearer = user API key
+	s.mux.HandleFunc("/v1/me", s.userOnly(s.meHandler))
+	s.mux.HandleFunc("/v1/me/buckets", s.userOnly(s.userBucketsHandler))
+}
+
+// userOnly resolves the bearer token to a tenant; rejects if unknown.
+func (s *Server) userOnly(h func(w http.ResponseWriter, r *http.Request, t *tenant.Tenant)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tok, ok := tenant.ParseBearer(r.Header.Get("Authorization"))
+		if !ok {
+			writeJSON(w, 401, map[string]any{"error": "bearer key required"})
+			return
+		}
+		key, err := s.store.GetKeyByHash(tenant.HashKey(tok))
+		if err != nil || key == nil || !key.Active() {
+			writeJSON(w, 401, map[string]any{"error": "unknown or revoked key"})
+			return
+		}
+		t, err := s.store.GetTenant(key.TenantID)
+		if err != nil {
+			writeJSON(w, 401, map[string]any{"error": "tenant not found"})
+			return
+		}
+		if t.Suspended {
+			writeJSON(w, 403, map[string]any{"error": "tenant suspended"})
+			return
+		}
+		h(w, r, t)
+	}
+}
+
+func (s *Server) meHandler(w http.ResponseWriter, r *http.Request, t *tenant.Tenant) {
+	writeJSON(w, 200, map[string]any{
+		"tenant_id":   t.ID,
+		"tag":         t.Tag,
+		"created_at":  t.CreatedAt,
+		"quotas":      t.Quotas,
+		"endpoint":    "https://edge.nats-kv.connected-cloud.io",
+	})
+}
+
+type createBucketReq struct {
+	Name        string `json:"name"`     // user-friendly; gets prefixed with tenant id
+	Replicas    int    `json:"replicas"` // 1/3/5
+	Geo         string `json:"geo"`      // na/eu/ap/sa/oc/auto
+	History     uint8  `json:"history"`  // KV history depth
+	WantMirrors bool   `json:"want_mirrors"`
+}
+
+func (s *Server) userBucketsHandler(w http.ResponseWriter, r *http.Request, t *tenant.Tenant) {
+	switch r.Method {
+	case http.MethodGet:
+		// List buckets owned by this tenant.
+		out := []string{}
+		prefix := t.ID + "."
+		for name := range s.js.KeyValueStoreNames() {
+			if strings.HasPrefix(name, prefix) {
+				out = append(out, name)
+			}
+		}
+		writeJSON(w, 200, map[string]any{"buckets": out, "tenant_id": t.ID})
+	case http.MethodPost:
+		s.createUserBucket(w, r, t)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) createUserBucket(w http.ResponseWriter, r *http.Request, t *tenant.Tenant) {
+	var req createBucketReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]any{"error": "bad json"})
+		return
+	}
+	if req.Name == "" || strings.ContainsAny(req.Name, ".$> *") {
+		writeJSON(w, 400, map[string]any{"error": "name required, no dots/spaces/wildcards"})
+		return
+	}
+	if req.Replicas == 0 {
+		req.Replicas = 3
+	}
+	if req.Replicas != 1 && req.Replicas != 3 && req.Replicas != 5 {
+		writeJSON(w, 400, map[string]any{"error": "replicas must be 1/3/5"})
+		return
+	}
+	if req.History == 0 {
+		req.History = 8
+	}
+	if req.Geo == "" {
+		req.Geo = "auto"
+	}
+
+	bucketName := t.ID + "." + req.Name
+	cfg := &nats.KeyValueConfig{
+		Bucket:      bucketName,
+		History:     req.History,
+		Storage:     nats.FileStorage,
+		Replicas:    req.Replicas,
+		Description: "tenant=" + t.ID + " name=" + req.Name,
+	}
+	if req.Geo != "auto" && req.Geo != "any" {
+		cfg.Placement = &nats.Placement{Tags: []string{"geo:" + req.Geo}}
+	}
+	kv, err := s.js.CreateKeyValue(cfg)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"error": "create bucket: " + err.Error()})
+		return
+	}
+	_ = kv
+
+	// Auto-create mirrors in the other geos for read-locality, if requested.
+	mirrors := []string{}
+	if req.WantMirrors && req.Replicas >= 1 {
+		mirrorGeos := []string{"na", "eu", "ap", "sa"}
+		for _, g := range mirrorGeos {
+			if g == req.Geo {
+				continue
+			}
+			mirrorName := "KV_" + bucketName + "_mirror_" + g
+			_, err := s.js.AddStream(&nats.StreamConfig{
+				Name:    mirrorName,
+				Mirror:  &nats.StreamSource{Name: "KV_" + bucketName},
+				Storage: nats.FileStorage,
+				Placement: &nats.Placement{Tags: []string{"geo:" + g}},
+				Replicas: 1,
+				AllowDirect: true,
+				MirrorDirect: true,
+				Duplicates: 2 * time.Minute,
+			})
+			if err == nil {
+				mirrors = append(mirrors, mirrorName)
+			}
+		}
+	}
+
+	s.store.Audit(r.Context(), t.ID, "bucket.create", "bucket", bucketName, req.Geo)
+	writeJSON(w, 200, map[string]any{
+		"bucket":   bucketName,
+		"replicas": req.Replicas,
+		"geo":      req.Geo,
+		"history":  req.History,
+		"mirrors":  mirrors,
+		"endpoint": "https://edge.nats-kv.connected-cloud.io",
+		"sample_url": "https://edge.nats-kv.connected-cloud.io/v1/kv/" + bucketName + "/<key>",
+	})
 }
 
 func (s *Server) internalKeysHandler(w http.ResponseWriter, r *http.Request) {

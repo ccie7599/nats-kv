@@ -60,7 +60,7 @@ func main() {
 		log.Fatalf("store init: %v", err)
 	}
 
-	srv := control.New(store, adminToken, pubBaseURL)
+	srv := control.New(store, adminToken, pubBaseURL, js)
 
 	httpSrv := &http.Server{
 		Addr:              listen,
