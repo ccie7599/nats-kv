@@ -248,18 +248,19 @@ func (s *Server) bucketSummary(name string) map[string]any {
 		if info.Cluster != nil {
 			peers := []map[string]any{}
 			peers = append(peers, map[string]any{
-				"name":    info.Cluster.Leader,
-				"role":    "leader",
-				"current": true,
-				"lag_ms":  0,
+				"name":      info.Cluster.Leader,
+				"role":      "leader",
+				"current":   true,
+				"lag_msgs":  0, // leader has no lag (it IS the source); rendered as "—" in UI
+				"active_ms": 0, // ditto for last-seen
 			})
 			for _, p := range info.Cluster.Replicas {
 				peers = append(peers, map[string]any{
-					"name":    p.Name,
-					"role":    "replica",
-					"current": p.Current,
-					"active":  p.Active.Milliseconds(),
-					"lag_ms":  p.Lag,
+					"name":      p.Name,
+					"role":      "replica",
+					"current":   p.Current,
+					"active_ms": p.Active.Milliseconds(), // ms since this peer's last heartbeat from leader's view
+					"lag_msgs":  p.Lag,                   // ops behind leader (NOT milliseconds — nats.go ClusterInfo.Replicas[].Lag is uint64 sequence delta)
 				})
 			}
 			entry["peers"] = peers
