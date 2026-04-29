@@ -192,3 +192,21 @@ Property names match primary hostnames per global CLAUDE.md convention. Three Ak
 
 **Rejected**: Discovering and pinning FWF egress CIDRs in firewall rules. Akamai does not publish them, and they likely change.
 
+---
+
+## ADR-015 — Reuse `connectedcloud5.akadns.net` GTM domain instead of creating a new one
+**Status**: Accepted (2026-04-29) — supersedes the "own domain" intent in ADR-011
+
+**Context**: Tried to create `nats-kv.akadns.net` per ADR-011. The presales account's only contract (`M-1YX7F61`, `AKAMAI_INTERNAL`) returns `performancePlusDomainsCanNotBeCreated` from the config-gtm v1 API for any new domain. The 106 existing GTM domains in this account were all provisioned out-of-band (Control Center / Akamai support). Provisioning a new domain there blocks on a manual ticket.
+
+**Decision**: Add a `nats-kv` property + 27 dedicated `kv-<region>` datacenters into the existing `connectedcloud5.akadns.net` GTM domain (already used by mortgage-inference). Datacenter nicknames are kv-prefixed so we never collide with sibling demos. Property-scoped resources (traffic_targets, liveness_test) are isolated; domain-level resources (load_feedback toggle, default_timeout_penalty) are shared with siblings.
+
+**Consequences**:
+- DS2 stream for GTM events is **per-domain**, so we cannot independently enable/scope a DS2 feed just for nats-kv. If/when DS2 is enabled on `connectedcloud5.akadns.net`, the feed will include all sibling demos' events too. Filter at the consumer (ClickHouse) by property name.
+- TF state for GTM lives in `nats-kv/gtm/terraform.tfstate` in the LZ ObjStore bucket, separate from sibling demos' state. Their state owns the domain resource; ours owns only the property + 27 DCs + 1 DNS CNAME.
+- A future migration to a dedicated `nats-kv.akadns.net` domain remains possible (`terraform import` after Akamai support provisions it).
+
+**Edge hostname**: `nats-kv-edge.connected-cloud.io` CNAMEs to `nats-kv.connectedcloud5.akadns.net.`
+
+---
+
