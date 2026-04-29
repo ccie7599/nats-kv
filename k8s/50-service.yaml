@@ -30,7 +30,9 @@ metadata:
   namespace: demo-nats-kv
   annotations:
     service.beta.kubernetes.io/linode-loadbalancer-throttle: "0"
-    service.beta.kubernetes.io/linode-loadbalancer-firewall-id: "3900446"  # demo-nb-fw
+    # Firewall attached out-of-band (CCM rejects firewall_id annotation against
+    # account-scoped FWs in this LZ). Attach demo-nb-fw (3900446) post-create via
+    # `linode-cli firewalls device-create` once the NB exists.
 spec:
   type: LoadBalancer
   selector:
