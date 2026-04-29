@@ -13,7 +13,6 @@ import (
 
 	"github.com/bapley/project-nats-kv/internal/control"
 	"github.com/bapley/project-nats-kv/internal/placement"
-	"github.com/bapley/project-nats-kv/internal/probe"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/nats-io/nats.go"
 )
@@ -73,49 +72,6 @@ func main() {
 	}
 
 	srv := control.New(store, adminToken, pubBaseURL, nc, js, placer)
-
-	// Bootstrap the topology-freshness probe bucket (R3 + mirrors-everywhere)
-	// and start the periodic prober. The prober writes a timestamped payload
-	// every 5s and direct-reads each region's mirror to compute end-to-end
-	// replication delay — drives the topology page's "live freshness" panel.
-	probeCtx, probeCancel := context.WithCancel(context.Background())
-	defer probeCancel()
-	if placer != nil {
-		go func() {
-			// Retry bootstrap until it succeeds — placement engine needs to
-			// fetch the latency matrix, which can be slow on a cold CDN.
-			for attempt := 1; ; attempt++ {
-				ctx, cancel := context.WithTimeout(probeCtx, 60*time.Second)
-				d, err := srv.EnsureSharedBucket(ctx, probe.BucketName, "us-ord", 3, true,
-					"topology freshness probe — auto-managed")
-				cancel()
-				if err == nil {
-					if d != nil {
-						log.Printf("probe bootstrap: created %s in %s (attempt %d)", probe.BucketName, d.ChosenGeo, attempt)
-					} else {
-						log.Printf("probe bootstrap: %s already exists (attempt %d)", probe.BucketName, attempt)
-					}
-					prober := probe.New(js)
-					go prober.Run(probeCtx)
-					srv.SetProber(prober)
-					log.Print("topology freshness probe started (5s interval)")
-					return
-				}
-				wait := time.Duration(attempt*5) * time.Second
-				if wait > 60*time.Second {
-					wait = 60 * time.Second
-				}
-				log.Printf("probe bootstrap attempt %d failed: %v (retry in %s)", attempt, err, wait)
-				select {
-				case <-probeCtx.Done():
-					return
-				case <-time.After(wait):
-				}
-			}
-		}()
-	} else {
-		log.Print("topology freshness probe disabled (placement engine unavailable)")
-	}
 
 	httpSrv := &http.Server{
 		Addr:              listen,

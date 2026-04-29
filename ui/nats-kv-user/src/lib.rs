@@ -718,12 +718,6 @@ const TOPOLOGY_HTML: &str = r##"<!doctype html>
   </div>
 </fieldset>
 
-<fieldset id="freshness-panel">
-  <legend>Cluster freshness <span id="freshness-meta" class="meta" style="font-weight:normal"></span></legend>
-  <p class="meta" style="margin:0 0 6px;font-size:11px;">End-to-end replication delay measured every 5s by writing a timestamp to <code>topology_probe</code> and direct-reading each region's mirror. <code>delta_ms = sampledAt − writtenAt</code>. Sub-30ms = synchronous-feeling; intercontinental mirrors typically 30-200ms.</p>
-  <div id="freshness-grid" style="display:grid; grid-template-columns:repeat(auto-fill,minmax(160px,1fr)); gap:6px; font-size:12px"></div>
-</fieldset>
-
 <svg id="map" viewBox="0 0 1000 500" width="100%" preserveAspectRatio="xMidYMid meet">
   <defs>
     <radialGradient id="leader-glow"><stop offset="0%" stop-color="#3fb950" stop-opacity="0.6"/><stop offset="100%" stop-color="#3fb950" stop-opacity="0"/></radialGradient>
@@ -906,36 +900,25 @@ function selectBucket(i) {
     <div><strong>${b.name}</strong> <span class="pill ${repClass}">R${b.replicas||1}</span> ${(b.mirrors||[]).length ? `<span class="pill mirror">+${b.mirrors.length} mirrors</span>` : ''}</div>
     <div class="meta">cluster: ${b.cluster||'?'} · values: ${b.values||0} · bytes: ${b.bytes||0} · history: ${b.history||0}</div>
     <h3 style="font-size:13px; margin:12px 0 4px">RAFT replicas</h3>
-    <p class="meta" style="margin:0 0 4px;font-size:11px;">Behind = ops this replica is behind the leader (0 = caught up; sync replication keeps it near zero). For end-to-end replication delay across the cluster, see the Cluster freshness panel above.</p>
     <table style="width:100%; font-size:12px;">
-      <thead><tr><th style="text-align:left">Peer</th><th>Role</th><th>Current</th><th>Behind (ops)</th></tr></thead>
-      <tbody>${(b.peers||[]).map(p => {
-        // Accept both new (lag_msgs) and old (lag_ms) field names while adapters roll.
-        const behind = (p.lag_msgs ?? p.lag_ms) || 0;
-        const behindCls = behind<1?'ok':behind<10?'warn':'err';
-        return `<tr>
+      <thead><tr><th style="text-align:left">Peer</th><th>Role</th><th>Current</th></tr></thead>
+      <tbody>${(b.peers||[]).map(p => `
+        <tr>
           <td>${p.name}</td>
           <td>${p.role}</td>
           <td>${p.current ? '<span class="ok">✓</span>' : '<span class="err">✗</span>'}</td>
-          <td class="lag ${behindCls}">${behind}</td>
-        </tr>`;
-      }).join("")}</tbody>
+        </tr>`).join("")}</tbody>
     </table>
     ${(b.mirrors||[]).length ? `
     <h3 style="font-size:13px; margin:12px 0 4px">Async mirrors (read replicas) <span class="meta" style="font-weight:normal;font-size:11px">— ${b.mirrors.length} of 27 regions</span></h3>
-    <p class="meta" style="margin:0 0 4px;font-size:11px;">Behind = ops this mirror is behind the source (async replication; recovers after each write burst).</p>
     <table style="width:100%; font-size:12px;">
-      <thead><tr><th style="text-align:left">Stream</th><th>Leader</th><th>Tags</th><th>Behind (ops)</th></tr></thead>
-      <tbody>${(b.mirrors||[]).map(m => {
-        const behind = m.lag_msgs || 0;
-        const behindCls = behind<5?'ok':behind<50?'warn':'err';
-        return `<tr>
+      <thead><tr><th style="text-align:left">Stream</th><th>Leader</th><th>Tags</th></tr></thead>
+      <tbody>${(b.mirrors||[]).map(m => `
+        <tr>
           <td>${m.stream}</td>
           <td>${m.leader||'?'}</td>
           <td>${(m.placement_tags||[]).join(',')}</td>
-          <td class="lag ${behindCls}">${behind}</td>
-        </tr>`;
-      }).join("")}</tbody>
+        </tr>`).join("")}</tbody>
     </table>` : ''}
   `;
   document.getElementById("bucket-detail").style.display = "block";
@@ -948,44 +931,6 @@ function autoRefresh() {
   document.getElementById("auto-btn").textContent = "Auto-refresh (5s)";
 }
 
-// --- Cluster freshness panel ---------------------------------------------
-// Polls /v1/topology/freshness every 3s. The control plane runs a 5s probe;
-// 3s polling means the page never lags more than one probe cycle behind.
-async function loadFreshness() {
-  try {
-    const r = await fetch("/api/control/v1/topology/freshness");
-    if (!r.ok) {
-      const j = await r.json().catch(()=>({error:`HTTP ${r.status}`}));
-      document.getElementById("freshness-grid").innerHTML = `<div class="err">${j.error||r.status}</div>`;
-      return;
-    }
-    const snap = await r.json();
-    document.getElementById("freshness-meta").textContent =
-      ` · last probe ${snap.last_probe_at ? new Date(snap.last_probe_at).toLocaleTimeString() : 'never'} · seq ${snap.last_write_seq||'?'} · interval ${snap.interval_ms||5000}ms`;
-    const regions = Object.entries(snap.regions||{}).sort();
-    document.getElementById("freshness-grid").innerHTML = regions.map(([name, r]) => {
-      if (r.error) {
-        return `<div style="padding:6px;border:1px solid #f85149;border-radius:3px;background:#0d1117"><div><b>${name}</b></div><div class="err" style="font-size:10px">${r.error}</div></div>`;
-      }
-      const d = r.delta_ms||0;
-      // Color: synchronous-class <30, intra-region <80, intra-continent <200, intercontinental <400, slow > 400
-      const color = d<30?'#3fb950':d<80?'#5ec779':d<200?'#d29922':d<400?'#db6d28':'#f85149';
-      const tag = r.source==='raft-replica'?'RAFT':r.source==='source-fallback'?'src':'mirror';
-      return `<div style="padding:6px;border:1px solid #30363d;border-radius:3px;background:#0d1117">
-        <div style="display:flex;justify-content:space-between;align-items:baseline">
-          <span><b>${name}</b></span>
-          <span style="font-size:10px;color:#8b949e">${tag}</span>
-        </div>
-        <div style="font-size:18px;font-weight:600;color:${color}">${d.toFixed(1)} <span style="font-size:11px;font-weight:normal;color:#8b949e">ms</span></div>
-      </div>`;
-    }).join("") || '<div class="meta">no probe data yet</div>';
-  } catch (e) {
-    document.getElementById("freshness-grid").innerHTML = `<div class="err">probe load failed: ${e.message}</div>`;
-  }
-}
-loadFreshness();
-setInterval(loadFreshness, 3000);
-
 loadAll();
 </script>
 </body></html>
@@ -995,6 +940,15 @@ const PLAY_HTML: &str = r##"<!doctype html>
 <html><head><meta charset="utf-8"><title>NATS KV vs Cosmos — playground</title><style>__SHARED_CSS__</style></head><body>
 <h1>NATS-KV vs Cosmos playground</h1>
 <p class="sub">Server-side timings from inside this Spin function on Akamai Functions. Endpoint: <code>edge.nats-kv.connected-cloud.io</code> (GTM-routed to nearest of 27 regions).</p>
+
+<fieldset>
+  <legend>NATS bucket under test</legend>
+  <div class="row">
+    <div><label>bucket</label><select id="play-bucket" onchange="updateBucketInfo()"></select></div>
+    <div style="flex:2"><label>placement</label><div id="play-bucket-info" class="meta" style="font-size:11px; padding:6px 0">(loading…)</div></div>
+  </div>
+  <p class="meta" style="margin:0; font-size:11px;">Pick any bucket you own (plus the shared <code>demo</code>) to compare topologies — R1 vs R3 vs R5, or different geo placements. NATS calls below run against the selected bucket; Cosmos always uses Spin's managed default store.</p>
+</fieldset>
 
 <fieldset>
   <legend>Single op</legend>
@@ -1046,15 +1000,71 @@ const PLAY_HTML: &str = r##"<!doctype html>
 renderNav('play');
 const $ = (id) => document.getElementById(id);
 
+// Selected bucket for all NATS-side playground operations. Cosmos always uses
+// Spin's managed default store — there's only one of those — so the picker
+// only affects NATS calls.
+function natsBucket() {
+  const sel = $("play-bucket");
+  return (sel && sel.value) || "demo";
+}
+
+// Populate the picker: shared `demo` always available; tenant buckets if signed in.
+// Caches details for the info panel (placement / mirror count) keyed by bucket name.
+const _bucketDetails = {};
+async function loadPlayBuckets() {
+  const sel = $("play-bucket");
+  const opts = [{name: "demo", label: "demo (shared, R3 NA, 27 mirrors)", details: null}];
+  if (userKey()) {
+    try {
+      const r = await fetch("/api/control/v1/me/buckets", { headers: {"Authorization": "Bearer " + userKey()} });
+      if (r.ok) {
+        const j = await r.json();
+        for (const d of (j.details||[])) {
+          // strip the tenant prefix from the visible label so the picker is readable.
+          const short = d.name.includes("__") ? d.name.split("__").slice(1).join("__") : d.name;
+          opts.push({name: d.name, label: `${short} (R${d.replicas||1}, ${d.mirror_count||0} mirrors)`, details: d});
+        }
+      }
+    } catch (e) { /* leave demo only */ }
+  }
+  // Try to fetch the demo bucket's details too (anyone can read /v1/admin/buckets via a valid key).
+  try {
+    const r = await fetch("/api/nats/v1/admin/buckets", { headers: {"X-KV-Key": userKey() || "akv_demo_open"} });
+    const j = await r.json();
+    const inner = JSON.parse(atob(j.body_b64||""));
+    for (const b of (inner.buckets||[])) {
+      _bucketDetails[b.name] = b;
+    }
+  } catch (e) {}
+  for (const o of opts) {
+    if (!_bucketDetails[o.name] && o.details) _bucketDetails[o.name] = o.details;
+  }
+  sel.innerHTML = opts.map(o => `<option value="${o.name}">${o.label}</option>`).join("");
+  updateBucketInfo();
+}
+
+function updateBucketInfo() {
+  const name = natsBucket();
+  const d = _bucketDetails[name];
+  const el = $("play-bucket-info");
+  if (!d) { el.textContent = `bucket=${name} (no details available)`; return; }
+  const peers = (d.peers||[]).map(p => (p.name||'').replace(/^kv-/,'')).join(", ") || (d.leader||'').replace(/^kv-/,'') || "?";
+  const tags = (d.placement_tags||[]).join(",") || "(none)";
+  const mirrorCount = d.mirror_count !== undefined ? d.mirror_count : (d.mirrors||[]).length;
+  el.innerHTML = `<code>${name}</code> · R${d.replicas||1} · placement <code>${tags}</code> · peers <code>${peers}</code> · ${mirrorCount} read mirrors`;
+}
+
 async function op(backend, verb) {
   const k = $("key").value;
   const v = $("value").value;
+  const b = natsBucket();
   if (verb === "INCR") {
-    return fetchOp(`nats/v1/kv/demo/${encodeURIComponent(k)}/incr`, "POST", undefined, "single-out", "NATS INCR", "nats");
+    return fetchOp(`nats/v1/kv/${encodeURIComponent(b)}/${encodeURIComponent(k)}/incr`, "POST", undefined, "single-out", `NATS INCR (${b})`, "nats");
   }
-  const path = backend === "nats" ? `nats/v1/kv/demo/${encodeURIComponent(k)}` : `cosmos/default/${encodeURIComponent(k)}`;
+  const path = backend === "nats" ? `nats/v1/kv/${encodeURIComponent(b)}/${encodeURIComponent(k)}` : `cosmos/default/${encodeURIComponent(k)}`;
   let body = verb === "PUT" ? v : undefined;
-  return fetchOp(path, verb, body, "single-out", `${backend.toUpperCase()} ${verb}`, backend);
+  const label = backend === "nats" ? `NATS ${verb} (${b})` : `COSMOS ${verb}`;
+  return fetchOp(path, verb, body, "single-out", label, backend);
 }
 
 async function fetchOp(path, method, body, outId, label, backend) {
@@ -1086,11 +1096,12 @@ async function runBench() {
   const N = parseInt($("bench-n").value, 10);
   const key = "bench-key";
   const body = "bench-payload";
-  $("nats-stats").textContent = "running...";
+  const b = natsBucket();
+  $("nats-stats").innerHTML = `running… (bucket: <code>${b}</code>)`;
   $("cosmos-stats").textContent = "running...";
   const collect = async (backend) => {
     const upstream = []; const browser = [];
-    const path = backend === "nats" ? `nats/v1/kv/demo/${key}` : `cosmos/default/${key}`;
+    const path = backend === "nats" ? `nats/v1/kv/${encodeURIComponent(b)}/${key}` : `cosmos/default/${key}`;
     for (let i = 0; i < N; i++) {
       const t0 = performance.now();
       const opts = { method: verb, headers: {} };
@@ -1129,28 +1140,32 @@ async function runBench() {
 }
 
 async function natsHistory() {
+  const b = natsBucket();
   const k = "demo-key-" + Date.now();
   for (let i = 1; i <= 5; i++) {
-    await authedFetch(`/api/nats/v1/kv/demo/${k}`, { method: "PUT", body: "version-" + i });
+    await authedFetch(`/api/nats/v1/kv/${encodeURIComponent(b)}/${k}`, { method: "PUT", body: "version-" + i });
   }
-  const r = await authedFetch(`/api/nats/v1/kv/demo/${k}/history`);
+  const r = await authedFetch(`/api/nats/v1/kv/${encodeURIComponent(b)}/${k}/history`);
   const j = await r.json();
-  $("demo-out").textContent = `Wrote 5 revisions of "${k}". History (server-side ${(j.upstream_us/1000).toFixed(1)} ms):\n` + atob(j.body_b64);
+  $("demo-out").textContent = `Wrote 5 revisions of "${k}" in ${b}. History (server-side ${(j.upstream_us/1000).toFixed(1)} ms):\n` + atob(j.body_b64);
 }
 async function natsSubject() {
+  const b = natsBucket();
   const id = Date.now();
   for (const u of ["alice","bob","carol","dave"]) {
-    await authedFetch(`/api/nats/v1/kv/demo/users.${u}.${id}.session`, { method: "PUT", body: u });
+    await authedFetch(`/api/nats/v1/kv/${encodeURIComponent(b)}/users.${u}.${id}.session`, { method: "PUT", body: u });
   }
-  const r = await authedFetch(`/api/nats/v1/kv/demo/keys?match=users.*.${id}.session`);
+  const r = await authedFetch(`/api/nats/v1/kv/${encodeURIComponent(b)}/keys?match=users.*.${id}.session`);
   const j = await r.json();
-  $("demo-out").textContent = `Wrote 4 keys with subject pattern users.<name>.${id}.session\nWildcard query users.*.${id}.session (server-side ${(j.upstream_us/1000).toFixed(1)} ms):\n` + atob(j.body_b64) + `\n\nCosmos has no equivalent — keys must be exact-match or full table scan.`;
+  $("demo-out").textContent = `Wrote 4 keys with subject pattern users.<name>.${id}.session in ${b}\nWildcard query users.*.${id}.session (server-side ${(j.upstream_us/1000).toFixed(1)} ms):\n` + atob(j.body_b64) + `\n\nCosmos has no equivalent — keys must be exact-match or full table scan.`;
 }
 async function natsCluster() {
   const r = await authedFetch(`/api/nats/v1/admin/cluster`);
   const j = await r.json();
   $("demo-out").textContent = atob(j.body_b64);
 }
+
+loadPlayBuckets();
 </script>
 </body></html>
 "##;

@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/bapley/project-nats-kv/internal/placement"
-	"github.com/bapley/project-nats-kv/internal/probe"
 	"github.com/bapley/project-nats-kv/internal/tenant"
 	"github.com/nats-io/nats.go"
 )
@@ -24,13 +23,7 @@ type Server struct {
 	nc         *nats.Conn        // raw NATS connection — used for stream-leader-stepdown API requests
 	js         nats.JetStreamContext
 	placer     *placement.Engine // nil disables auto-placement (falls back to NATS default)
-	prober     *probe.Prober     // nil disables /v1/topology/freshness; set via SetProber after bootstrap
 }
-
-// SetProber attaches a Prober whose Snapshot() drives /v1/topology/freshness.
-// Called from cmd/control/main.go once the probe bucket is materialized and
-// the prober loop has been started.
-func (s *Server) SetProber(p *probe.Prober) { s.prober = p }
 
 func New(store *Store, adminToken, pubBaseURL string, nc *nats.Conn, js nats.JetStreamContext, placer *placement.Engine) *Server {
 	s := &Server{store: store, mux: http.NewServeMux(), adminToken: adminToken, pubBaseURL: strings.TrimRight(pubBaseURL, "/"), nc: nc, js: js, placer: placer}
@@ -80,11 +73,6 @@ func (s *Server) routes() {
 	// "what would auto pick?" panel before the user commits to creating a
 	// bucket. Read-only; doesn't touch JetStream.
 	s.mux.HandleFunc("/v1/placement/preview", s.placementPreviewHandler)
-
-	// Topology freshness — periodic probe writes to topology_probe and reads
-	// each region's mirror to compute end-to-end replication delay. Open
-	// (no auth); read-only snapshot from in-memory prober state.
-	s.mux.HandleFunc("/v1/topology/freshness", s.topologyFreshnessHandler)
 }
 
 // placementPreviewHandler runs the placement engine without creating a bucket,
@@ -121,22 +109,6 @@ func (s *Server) placementPreviewHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, 200, d)
-}
-
-// topologyFreshnessHandler returns the latest snapshot from the periodic
-// replication-delay probe — for each of the 27 regions, how stale that
-// region's mirror is relative to the most recent write at the source.
-// More honest signal than NATS's per-peer keepalive heartbeat counter.
-func (s *Server) topologyFreshnessHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	if s.prober == nil {
-		writeJSON(w, 503, map[string]any{"error": "freshness probe not running"})
-		return
-	}
-	writeJSON(w, 200, s.prober.Snapshot())
 }
 
 // userOnly resolves the bearer token to a tenant; rejects if unknown.
