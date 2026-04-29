@@ -176,3 +176,19 @@ Defense in depth (3 layers):
 Property names match primary hostnames per global CLAUDE.md convention. Three Akamai properties total + one GTM domain.
 
 **Rejected**: Single combined hostname for data + control plane. Separation lets us scale them independently and route through different cache policies.
+
+---
+
+## ADR-014 — Adapter NB firewall stays open; rely on token auth at the adapter
+**Status**: Accepted (2026-04-29)
+
+**Context**: FWF Spin functions egress from Akamai infrastructure but their source CIDRs are not published and don't appear in the standard Akamai OIPACL. Attaching `demo-nb-fw` (3900446) to the adapter NodeBalancer caused FWF→adapter calls to fail with `ConnectionRefused`. Other LZ demos solve this by fronting the origin with an Akamai property — that lets the FW restrict to OIPACL because requests then arrive from Akamai edge, not FWF egress.
+
+**Decision**: For this POC we leave the adapter NodeBalancer firewall **open** and rely on bearer-token authentication at the adapter (`Authorization: Bearer <token>`) for all `/v1/kv/*` and `/v1/admin/*` endpoints. Only `/v1/health` is unauthenticated (needed for GTM liveness probes).
+
+**Consequences**: The adapter is internet-reachable on port 80; any unauthorized request gets `401`. Tokens are issued and rotated through the control plane (when v0.3 lands). For the demo, a single shared `akv_demo_open` token in Vault is acceptable.
+
+**Future hardening (not v0.2)**: Akamaize the endpoint via an Akamai property in front of the NB. Then re-attach `demo-nb-fw` (or a new FW) restricting NB ingress to OIPACL only, and TLS terminates at the edge. This is the standard pattern for LZ demos — pending until we add the Akamai property in v0.3+.
+
+**Rejected**: Discovering and pinning FWF egress CIDRs in firewall rules. Akamai does not publish them, and they likely change.
+
