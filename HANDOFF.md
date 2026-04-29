@@ -10,24 +10,43 @@
 
 ## Try it in 5 minutes
 
-| Surface | URL |
-|---|---|
-| **User app** (playground, dashboard, topology, docs, verify, load test, API explorer) | `https://3c5be533-8e6d-423b-9962-87d9da8d16cd.fwf.app/` |
-| **Admin app** (mint invites, list tenants, regen keys) | `https://947e30b4-0481-4a14-bb05-fb83580e8594.fwf.app/` |
-| Data plane (GTM-routed) | `https://edge.nats-kv.connected-cloud.io/v1/...` |
-| Control plane (LZ only) | `https://cp.nats-kv.connected-cloud.io/v1/...` |
+| Surface | URL | Auth |
+|---|---|---|
+| **User app** (playground, dashboard, topology, docs, verify, load test, API explorer) | `https://nats-kv.connected-cloud.io/` (Akamai) or `https://3c5be533-8e6d-423b-9962-87d9da8d16cd.fwf.app/` (FWF direct) | UI gate token (`?access=<token>`) |
+| **Admin app** (mint invites, list tenants, approve invite requests, regen keys) | `https://nats-kv-admin.connected-cloud.io/` (Akamai) or `https://947e30b4-0481-4a14-bb05-fb83580e8594.fwf.app/` (FWF direct) | Admin gate token + admin bearer |
+| Data plane (GTM-routed, no UI gate) | `https://edge.nats-kv.connected-cloud.io/v1/...` | KV bearer |
+| Control plane (LZ only, no UI gate) | `https://cp.nats-kv.connected-cloud.io/v1/...` | tenant bearer for `/v1/me/*`; admin bearer for `/v1/admin/*` |
+| Grafana — nats-kv property dashboard | `https://grafana.connected-cloud.io/d/nats-kv` | LZ Grafana login |
+| Grafana — DS2 cross-demo analytics | `https://grafana.connected-cloud.io/d/ds2-cdn-analytics` (filter `demo=nats-kv`) | LZ Grafana login |
 
-**Open demo bearer**: `akv_demo_open` — works against the shared `demo` bucket. No claim flow needed.
+**Tokens** (rotate via `spin aka variables set <name>=<value>`):
 
-**Steps**:
-1. Hit the user app `/play` → run a side-by-side bench against Cosmos to see the perf shape.
-2. `/verify` → run all 10 functional tests against the `demo` bucket. Should be 10/10 pass.
-3. `/topology` → see the 27-region mesh with bucket placement overlays.
-4. `/docs` → full API reference, sample Spin function code, throughput projections, caveats.
-5. `/api-explorer` → Swagger UI; Authorize once with `akv_demo_open`, run any endpoint live.
-6. `/loadtest` → drive concurrent traffic and measure ops/sec, p50/p95/p99.
+| Token | Default | Purpose | Where stored |
+|---|---|---|---|
+| User-app UI gate | `demo-open-2026` | Unlocks the demo UI shell (`/play`, `/dash`, `/docs`, etc.) | Spin variable `ui_gate_token` |
+| Admin-app UI gate | `admin-gate-2026-rotateme` | Unlocks the admin UI shell | Spin variable `admin_gate_token` |
+| Admin bearer | (Vault) | Lets admin actually call control-plane admin endpoints | `api/data/nats-kv/control` → `admin_token` |
+| Open demo KV bearer | `akv_demo_open` | Hardcoded; lets anyone read/write the shared `demo` bucket | source |
 
-For your own tenant + buckets, the admin app issues invite URLs that one-shot claim into a tenant + API key. Admin token is in Vault at `api/data/nats-kv/control` (key `admin_token`); also retrievable from the live LZ pod with `kubectl exec -n demo-nats-kv deploy/kv-control -c control -- cat /vault/secrets/admin-token`.
+**Three gate layers, intentionally separate:**
+1. **UI gate token** (this page) — unlocks the *page* for browsing.
+2. **KV bearer** — lets you *do KV operations* once you're past the gate.
+3. **Admin bearer** — lets you *manage tenants/invites*, gates `/v1/admin/*`.
+
+**Steps for a vetted user (after admin shares a URL)**:
+1. Click the URL the admin app generated — it carries `?access=<gate>` AND `/claim/<invite>`. The first hit sets the UI gate cookie and runs the claim flow, leaving the user with a tenant + KV bearer + UI cookie. They land on the dashboard.
+2. From `/play` they can run side-by-side bench, `/verify` to run all 10 smoke tests, `/topology` to see the cluster live, `/loadtest` to drive throughput, `/docs` for API reference, `/api-explorer` for Swagger.
+
+**Steps for a fresh visitor (no link)**:
+1. Hit `https://nats-kv.connected-cloud.io/` — sees the gate page.
+2. Submits the "Request invite" form (name + email + reason).
+3. Request stored in NATS KV bucket `kv-admin-invite-requests-v1` (R5/NA).
+4. Brian sees it in admin app → "Pending invite requests" panel → clicks Approve → admin app shows a complete share URL (Akamai + FWF-direct variants) → Brian sends to requester.
+5. Requester clicks the URL → completes flow per "vetted user" steps above.
+
+**Walking around as Brian**:
+- Admin gate token + admin bearer both go in via the admin app's UI.
+- The admin bearer can also be retrieved live from the LZ pod: `KUBECONFIG=/tmp/lz-kubeconfig.yaml kubectl exec -n demo-nats-kv deploy/kv-control -c control -- cat /vault/secrets/admin-token`
 
 ---
 
@@ -36,10 +55,13 @@ For your own tenant + buckets, the admin app issues invite URLs that one-shot cl
 | Component | Version | Where |
 |---|---|---|
 | `kv-adapter` | `v0.2.5` | All 27 LKE clusters (1 LZ + 26 leaves), presales account |
-| `kv-control` | `v0.1.20` | LZ only (`presales-landing-zone`, `demo-nats-kv` namespace) |
-| `nats-kv-user` Spin app | latest | Akamai Functions, `3c5be533-8e6d-423b-9962-87d9da8d16cd.fwf.app` |
-| `nats-kv-admin` Spin app | latest | Akamai Functions, `947e30b4-0481-4a14-bb05-fb83580e8594.fwf.app` |
-| GTM property | `nats-kv` | `connectedcloud5.akadns.net` (shared domain) |
+| `kv-control` | `v0.1.21` | LZ only (`presales-landing-zone`, `demo-nats-kv` namespace) |
+| `nats-kv-user` Spin app | latest (gate-enabled) | Akamai Functions, `3c5be533-8e6d-423b-9962-87d9da8d16cd.fwf.app` |
+| `nats-kv-admin` Spin app | latest (gate + invite-requests panel) | Akamai Functions, `947e30b4-0481-4a14-bb05-fb83580e8594.fwf.app` |
+| GTM property (data plane) | `nats-kv` | `connectedcloud5.akadns.net` (shared domain) |
+| Akamai property (UI front-door) | `nats-kv` | single property, two hostnames (demo + admin), per-host rules — TF in `~/project-landing-zone/.../demos/nats-kv/` |
+| DataStream 2 stream | `nats-kv-ds2` | shared ClickHouse ingest at `ds2-im-demo.connected-cloud.io` |
+| Grafana dashboard | uid `nats-kv` | `https://grafana.connected-cloud.io/d/nats-kv` (LZ Grafana ConfigMap-managed) |
 | Latency hub dependency | external | `latency-demo.connected-cloud.io` (project-latency) |
 
 LZ adapter and control plane are reconciled by ArgoCD from this repo's `k8s/` dir. Leaf adapters are managed imperatively (DaemonSet `kubectl set image` across 26 clusters).
@@ -64,6 +86,41 @@ LZ adapter and control plane are reconciled by ArgoCD from this repo's `k8s/` di
 Each test uses random key suffixes and cleans up after itself. Run it after any version bump or new bucket creation.
 
 ---
+
+## Bringing up the Akamai property (one-time, post-cert)
+
+The single nats-kv Akamai property is defined in TF at `~/project-landing-zone/presales-landing-zone/infra/terraform/demos/nats-kv/`. Hostnames + cert SANs (293468 enrollment) need to be in place before activation. Procedure:
+
+```bash
+# 1. Add nats-kv.connected-cloud.io and nats-kv-admin.connected-cloud.io as SANs
+#    on enrollment 293468 (sse.connected-cloud.io). Use the helper at
+#    /tmp/akamai_cps.py from your local edgegrid venv:
+/tmp/akamai-venv/bin/python /tmp/akamai_cps.py add-sans 293468 \
+  nats-kv.connected-cloud.io,nats-kv-admin.connected-cloud.io
+
+# 2. Ack the pre-verification warnings (one-time prompt about overlapping cert):
+/tmp/akamai-venv/bin/python /tmp/akamai_cps.py ack-warnings 293468
+
+# 3. CPS asks for DNS challenge records — fetch values, add as TXT in the
+#    Akamai connected-cloud.io zone, then ack lets-encrypt-challenges-completed.
+#    (See the inline DNS-PUT loop in the deploy-day notes; uses Edge DNS API.)
+
+# 4. After cert deploys (~15-45 min), terraform apply.
+cd ~/project-landing-zone/presales-landing-zone/infra/terraform/demos/nats-kv
+terraform init && terraform apply
+
+# 5. Two-phase DS2: re-apply with the issued stream id
+STREAM_ID=$(terraform output -raw datastream_id)
+sed -i "s/ds2_stream_id        = 0/ds2_stream_id        = ${STREAM_ID}/" terraform.tfvars
+terraform apply
+
+# 6. Patch the demo-usage Grafana dashboard's `demo` variable so nats-kv
+#    appears in the dropdown:
+CP=$(terraform output -raw cp_code_id)
+cd ~/project-nats-kv && ./observability/grafana/apply.sh --cp "${CP}"
+```
+
+After step 6, both UI hostnames are live behind Akamai + DS2 logging is flowing into ClickHouse + the nats-kv Grafana dashboard begins populating.
 
 ## Operations cheatsheet
 
@@ -107,12 +164,13 @@ The adapter's `ensureBucket` flow auto-creates `demo` on first hit via the contr
 
 ## What's NOT done that you might want
 
-- **Multi-language SDK / code samples**. Only Rust example currently in `/docs`. TS and Python would be small additions.
+- **Multi-language SDK / code samples**. Only Rust example currently in `/docs §6`. TS and Python would each be ~50 lines.
 - **OTel traces from inside the adapter** (only metrics today). Pipeline exists at the latency hub.
-- **Grafana dashboards**. SCOPE.md lists this in exit criteria; deferred. Prometheus already scrapes `/varz` from each adapter via the OTel pipeline.
-- **Live load-test results in `/docs §9`** — placeholder projections still in place.
+- **Live load-test results in `/docs §9`** — placeholder projections still in place. Run `/loadtest` for ~30 min and replace.
 - **Native `key-value-nats` Spin factor crate** — the structural fix for the FWF↔adapter hop. Out of scope for this POC; data here makes the case for someone to take it on.
 - **Auto-rebalance on latency drift** — SCOPE non-goal but flagged in `DECISIONS.md`.
+- **GTM ECS** is currently disabled at the shared `connectedcloud5.akadns.net` domain — backend request open. Until then, FWF traffic routes to a per-resolver fixed mapping rather than per-client subnet.
+- **Email/Slack notification on new invite request** — today the request just sits in the admin app's "Pending requests" panel until you check it. Adding a Slack webhook would be ~20 lines of Go in `internalInviteRequestHandler`.
 
 ---
 
