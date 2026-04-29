@@ -13,6 +13,7 @@ import (
 
 	"github.com/bapley/project-nats-kv/internal/control"
 	"github.com/bapley/project-nats-kv/internal/placement"
+	"github.com/bapley/project-nats-kv/internal/probe"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/nats-io/nats.go"
 )
@@ -72,6 +73,31 @@ func main() {
 	}
 
 	srv := control.New(store, adminToken, pubBaseURL, nc, js, placer)
+
+	// Bootstrap the topology-freshness probe bucket (R3 + mirrors-everywhere)
+	// and start the periodic prober. The prober writes a timestamped payload
+	// every 5s and direct-reads each region's mirror to compute end-to-end
+	// replication delay — drives the topology page's "live freshness" panel.
+	probeCtx, probeCancel := context.WithCancel(context.Background())
+	defer probeCancel()
+	if placer != nil {
+		bootstrapCtx, bcancel := context.WithTimeout(probeCtx, 30*time.Second)
+		if d, err := srv.EnsureSharedBucket(bootstrapCtx, probe.BucketName, "us-ord", 3, true,
+			"topology freshness probe — auto-managed"); err != nil {
+			log.Printf("probe bootstrap: %v (freshness page will 503 until this resolves)", err)
+		} else if d != nil {
+			log.Printf("probe bootstrap: created %s in %s", probe.BucketName, d.ChosenGeo)
+		} else {
+			log.Printf("probe bootstrap: %s already exists", probe.BucketName)
+		}
+		bcancel()
+		prober := probe.New(js)
+		go prober.Run(probeCtx)
+		srv.SetProber(prober)
+		log.Print("topology freshness probe started (5s interval)")
+	} else {
+		log.Print("topology freshness probe disabled (placement engine unavailable)")
+	}
 
 	httpSrv := &http.Server{
 		Addr:              listen,
