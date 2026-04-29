@@ -1781,8 +1781,130 @@ const API_EXPLORER_HTML: &str = r##"<!doctype html>
 <html><head><meta charset="utf-8"><title>NATS-KV — API explorer</title>
 <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
 <style>__SHARED_CSS__
-  /* swagger-ui has its own theme; just give it a frame */
-  #swagger-ui { background:#fff; border-radius:6px; min-height:400px; }
+  /* ---- Dark-theme overrides for Swagger UI 5 ---- */
+  /* Site palette: bg #0d1117, panel #161b22, border #30363d, text #c9d1d9, muted #8b949e, accent #58a6ff. */
+  /* Verb colours preserved (GET blue, POST purple, PUT green, DELETE red) per /docs convention. */
+  #swagger-ui { background:#0d1117; border:1px solid #30363d; border-radius:6px; min-height:400px; padding:8px 0; }
+  .swagger-ui, .swagger-ui .info, .swagger-ui .info p, .swagger-ui .info li,
+  .swagger-ui .info table, .swagger-ui .opblock-tag, .swagger-ui .opblock .opblock-summary-path,
+  .swagger-ui .opblock .opblock-summary-description, .swagger-ui .opblock-description-wrapper p,
+  .swagger-ui .opblock-external-docs-wrapper, .swagger-ui .opblock-section-header h4,
+  .swagger-ui .opblock-section-header > label, .swagger-ui .opblock-section-header,
+  .swagger-ui .response-col_status, .swagger-ui .response-col_description,
+  .swagger-ui .responses-inner h4, .swagger-ui .responses-inner h5,
+  .swagger-ui .parameter__name, .swagger-ui .parameter__type, .swagger-ui .parameter__deprecated,
+  .swagger-ui .parameter__in, .swagger-ui .parameter__extension, .swagger-ui table thead tr th,
+  .swagger-ui table thead tr td, .swagger-ui table tbody tr td, .swagger-ui .tab li,
+  .swagger-ui .opblock-title_normal, .swagger-ui .model, .swagger-ui .model-title,
+  .swagger-ui section.models h4, .swagger-ui section.models h5, .swagger-ui .servers > label,
+  .swagger-ui label, .swagger-ui .scheme-container .schemes > label,
+  .swagger-ui .scheme-container, .swagger-ui .info .title small pre,
+  .swagger-ui .markdown p, .swagger-ui .markdown li, .swagger-ui .renderedMarkdown p,
+  .swagger-ui .renderedMarkdown li, .swagger-ui .response-control-media-type,
+  .swagger-ui .response-control-media-type__title, .swagger-ui .response-controls,
+  .swagger-ui .opblock-body, .swagger-ui .topbar { color:#c9d1d9; }
+
+  .swagger-ui .info .title { color:#58a6ff; }
+  .swagger-ui .info hgroup.main a { color:#58a6ff; }
+  .swagger-ui a { color:#58a6ff; }
+  .swagger-ui a:hover { color:#79c0ff; }
+
+  /* Tag headers (e.g. /v1/kv group) */
+  .swagger-ui .opblock-tag { background:#161b22; border-bottom:1px solid #30363d; padding:8px 16px; }
+  .swagger-ui .opblock-tag:hover { background:#1c2128; }
+  .swagger-ui .opblock-tag small { color:#8b949e; }
+
+  /* Operation panels */
+  .swagger-ui .opblock { background:#161b22; border:1px solid #30363d; box-shadow:none; margin:6px 0; }
+  .swagger-ui .opblock .opblock-summary { border-bottom:1px solid #30363d; }
+  .swagger-ui .opblock.opblock-get .opblock-summary { border-color:#1f6feb; }
+  .swagger-ui .opblock.opblock-get { border-color:#1f6feb55; }
+  .swagger-ui .opblock.opblock-post .opblock-summary { border-color:#bc8cff; }
+  .swagger-ui .opblock.opblock-post { border-color:#bc8cff55; }
+  .swagger-ui .opblock.opblock-put .opblock-summary { border-color:#3fb950; }
+  .swagger-ui .opblock.opblock-put { border-color:#3fb95055; }
+  .swagger-ui .opblock.opblock-delete .opblock-summary { border-color:#f85149; }
+  .swagger-ui .opblock.opblock-delete { border-color:#f8514955; }
+  .swagger-ui .opblock-summary-method { font-weight:600; }
+  .swagger-ui .opblock-summary-path, .swagger-ui .opblock-summary-path__deprecated { color:#c9d1d9; }
+
+  /* Inner sections (parameters / responses) */
+  .swagger-ui .opblock-section-header { background:#0d1117; border-top:1px solid #30363d; }
+  .swagger-ui .opblock-description-wrapper, .swagger-ui .opblock-external-docs-wrapper,
+  .swagger-ui .opblock .opblock-section .opblock-section-header { background:#0d1117; }
+  .swagger-ui .table-container, .swagger-ui .responses-wrapper, .swagger-ui .parameters-container { background:transparent; }
+  .swagger-ui .parameters-col_description input[type=text],
+  .swagger-ui input[type=text], .swagger-ui input[type=password], .swagger-ui input[type=search],
+  .swagger-ui input[type=email], .swagger-ui input[type=file], .swagger-ui textarea, .swagger-ui select {
+    background:#0d1117; color:#c9d1d9; border:1px solid #30363d; border-radius:3px;
+  }
+  .swagger-ui .parameters-col_description .markdown p { color:#8b949e; }
+
+  /* Tables (responses, parameters, schemas) */
+  .swagger-ui table thead tr td, .swagger-ui table thead tr th { background:#161b22; border-bottom:1px solid #30363d; color:#c9d1d9; }
+  .swagger-ui table tbody tr td { border-bottom:1px solid #21262d; }
+  .swagger-ui .response { border:none; }
+  .swagger-ui .responses-inner h4 { color:#c9d1d9; }
+  .swagger-ui .response-col_status { color:#3fb950; }
+  .swagger-ui .response-col_links { color:#8b949e; }
+
+  /* Schema / model boxes */
+  .swagger-ui .model-box, .swagger-ui section.models { background:#0d1117; border:1px solid #30363d; }
+  .swagger-ui .model-toggle:after { background:none; }
+  .swagger-ui section.models .model-container { background:#161b22; border:1px solid #30363d; }
+  .swagger-ui .model .property.primitive { color:#8b949e; }
+  .swagger-ui .model .prop-type { color:#79c0ff; }
+  .swagger-ui .model .prop-name { color:#c9d1d9; }
+  .swagger-ui .model-title { color:#c9d1d9; }
+  .swagger-ui .prop-format { color:#8b949e; }
+
+  /* Code / highlighted blocks (response body samples, curl) */
+  .swagger-ui .highlight-code, .swagger-ui .microlight, .swagger-ui pre {
+    background:#0d1117 !important; color:#c9d1d9 !important; border:1px solid #30363d; border-radius:3px;
+  }
+  .swagger-ui .opblock-body pre.microlight { background:#0d1117 !important; }
+
+  /* Buttons */
+  .swagger-ui .btn { background:#21262d; color:#c9d1d9; border:1px solid #30363d; }
+  .swagger-ui .btn:hover { background:#30363d; }
+  .swagger-ui .btn.execute { background:#1f6feb; color:#fff; border-color:#1f6feb; }
+  .swagger-ui .btn.execute:hover { background:#388bfd; }
+  .swagger-ui .btn.cancel { background:#21262d; color:#f85149; border-color:#f85149; }
+  .swagger-ui .btn.authorize { background:#3fb950; color:#0d1117; border-color:#3fb950; }
+  .swagger-ui .btn.authorize svg { fill:#0d1117; }
+  .swagger-ui .btn.authorize:hover { background:#4cc56b; }
+
+  /* Auth modal */
+  .swagger-ui .dialog-ux .modal-ux { background:#161b22; border:1px solid #30363d; color:#c9d1d9; }
+  .swagger-ui .dialog-ux .modal-ux-header { background:#0d1117; border-bottom:1px solid #30363d; }
+  .swagger-ui .dialog-ux .modal-ux-header h3 { color:#c9d1d9; }
+  .swagger-ui .auth-container h4, .swagger-ui .auth-container p { color:#c9d1d9; }
+  .swagger-ui .auth-container input[type=text],
+  .swagger-ui .auth-container input[type=password] { background:#0d1117; color:#c9d1d9; border:1px solid #30363d; }
+
+  /* Server selector */
+  .swagger-ui .scheme-container { background:#161b22; border:1px solid #30363d; box-shadow:none; padding:10px; }
+  .swagger-ui .servers > label select { background:#0d1117; color:#c9d1d9; border:1px solid #30363d; }
+
+  /* Filter / search */
+  .swagger-ui .filter .operation-filter-input { background:#0d1117; color:#c9d1d9; border:1px solid #30363d; }
+
+  /* Topbar (we hide it — we have our own nav) */
+  .swagger-ui .topbar { display:none; }
+
+  /* SVG icons (arrows, lock) — flip stroke to readable colour */
+  .swagger-ui svg:not(:root) { fill:#c9d1d9; }
+  .swagger-ui .opblock .opblock-summary svg { fill:#8b949e; }
+  .swagger-ui .opblock .opblock-summary .authorization__btn svg { fill:#d29922; }
+  .swagger-ui .opblock-summary-control:focus { outline:none; }
+
+  /* Tabs (e.g. example/schema toggle in responses) */
+  .swagger-ui .tab li { color:#8b949e; }
+  .swagger-ui .tab li.active { color:#c9d1d9; border-bottom:2px solid #58a6ff; }
+
+  /* Required asterisks etc. */
+  .swagger-ui .parameter__name.required:after { color:#f85149; }
+  .swagger-ui .parameter__name.required span { color:#f85149; }
 </style></head><body>
 <h1>API explorer</h1>
 <p class="sub">Interactive Swagger UI for the NATS-KV data plane and control plane. Authorize once with your bearer token and run any endpoint live.</p>
