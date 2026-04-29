@@ -210,6 +210,42 @@ Property names match primary hostnames per global CLAUDE.md convention. Three Ak
 
 ---
 
+## ADR-021 — Placement engine recommends a geo, not arbitrary regions (NATS placement tags are AND-only)
+**Status**: Accepted (2026-04-29)
+
+**Context**: SCOPE called for a "latency-driven placement engine" with three modes (auto/anchor/manual) that picks an optimal RAFT triple/quintuple from the 27 regions. Implementation hit a wall: NATS `placement.tags` is an AND filter — passing `[region:us-ord, region:eu-central, region:jp-osa]` matches zero servers because no single server has all three tags. There is no "place one replica in each of these specific regions" primitive in JetStream's stream config.
+
+**Two possible implementations:**
+
+1. **Geo-grouped placement.** Engine outputs the best *geo* (`na`/`eu`/`ap`/`sa`) for an anchor and emits `tags: [geo:<g>]`. NATS picks N servers carrying that tag. Coarser-grained but uses tags every server already advertises — zero ops overhead.
+2. **Synthetic per-bucket tags.** Engine picks specific regions, then injects a unique tag onto each chosen server via a NATS server-config reload. NATS then matches those servers and only those. Finer-grained, but requires per-bucket reload coordination across 27 nodes.
+
+**Decision**: Ship (1) for v1. The UI gets the *informationally rich* output you wanted — anchor region, RTT from anchor to each candidate geo, median quorum edge per candidate, runner-up score deltas — but the placement tag we hand JetStream is just `geo:<g>`. NATS still picks the actual servers within the geo; in practice it picks the closest few because the cluster meta layer optimizes for connectivity. Verified against R3 buckets: engine recommended `[fr-par-2, de-fra-2, gb-lon]` for an `fr-par-2` anchor, NATS placed `[eu-central, de-fra-2, fr-par-2]` (all EU geo, slightly different specific regions). Both sets satisfy the customer-visible promise of "this bucket lives in EU."
+
+**Algorithm** (`internal/placement`):
+- Pull the live RTT matrix from `latency-demo.connected-cloud.io/api/v1/matrix` (60s in-process cache; serves stale on hub failure).
+- For each geo with ≥`replicas` regions, sort by RTT-from-anchor, take top-`replicas`, pick the leader within that set that minimizes `anchor→leader + leader's quorum edge`. Quorum edge = (ceil(k/2)-1)-th smallest leader→peer RTT.
+- Rank geos by minimum write-latency-from-anchor. Decision includes every evaluated geo with eligibility flag and reason — feeds the UI's "why this geo" panel.
+
+**Anchor sourcing** (v1):
+- `geo: "auto"` + optional `anchor: "<region>"` field on the create request → engine runs with that anchor.
+- `geo: "anchor:<region>"` shorthand also accepted.
+- No anchor supplied → defaults to `us-ord` (where the control plane lives) and labels the source as `default-control-plane` so the UI knows to nudge "tell us your nearest region for better placement."
+- GeoIP lookup from caller IP is deferred — Spin user-app already exposes `/api/whereami` (FWF egress geo), which it can pass as the anchor hint when calling create.
+
+**Network gotcha**: `latency.connected-cloud.io` (origin) is firewalled to specific source IPs and is unreachable from the LZ pod's NAT egress. Switched to the Akamai-fronted `latency-demo.connected-cloud.io` which works through the CDN. Adds 5-10ms to the matrix fetch but doesn't affect placement decisions because we cache for 60s.
+
+**New endpoint**: `GET /v1/placement/preview?anchor=&replicas=&mode=` returns the Decision without creating a bucket — for the dashboard's "preview" panel before a user clicks Create.
+
+**Future (not v1)**:
+- Synthetic-tag implementation (option 2) once the UI demands per-region precision.
+- Pull p50/p95 from project-latency once it exposes them — currently only the latest reading is in the matrix.
+- Auto-rebalance on drift (already in SCOPE non-goals as opt-in only).
+
+**Versions**: control `v0.1.10`. Rolled to LZ via Argo 2026-04-29.
+
+---
+
 ## ADR-020 — Adapter reads address the local mirror by stream name (NATS direct-get load-balances; we need explicit local pinning)
 **Status**: Accepted (2026-04-29)
 
