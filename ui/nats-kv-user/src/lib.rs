@@ -390,11 +390,27 @@ const DASH_HTML: &str = r##"<!doctype html>
   <p>Endpoint: <code>https://edge.nats-kv.connected-cloud.io</code></p>
 </fieldset>
 
+<fieldset id="create-bucket" style="display:none">
+  <legend>Create a bucket</legend>
+  <div class="row">
+    <div><label>name (will be prefixed with tenant ID)</label><input id="b-name" placeholder="sessions"></div>
+    <div><label>replicas</label><select id="b-replicas"><option value="1">R1 (single replica, max throughput)</option><option value="3" selected>R3 (RAFT, durable)</option><option value="5">R5 (RAFT, geo-spread)</option></select></div>
+    <div><label>geo (RAFT placement)</label><select id="b-geo"><option value="auto">auto (any)</option><option value="na">NA</option><option value="eu">EU</option><option value="ap">AP</option><option value="sa">SA</option></select></div>
+  </div>
+  <div class="actions">
+    <label style="display:flex; align-items:center; gap:6px; margin:0;"><input type="checkbox" id="b-mirrors" checked style="width:auto"> auto-create mirrors in other geos for local reads</label>
+    <button onclick="createBucket()">Create</button>
+  </div>
+  <div id="create-out" class="meta" style="margin-top:6px"></div>
+</fieldset>
+
 <fieldset id="buckets" style="display:none">
-  <legend>Buckets in your tenant</legend>
+  <legend>Your buckets</legend>
   <div class="actions"><button class="secondary" onclick="loadBuckets()">Refresh</button></div>
-  <pre id="buckets-out">(click Refresh)</pre>
-  <p class="meta">In v0.5 each bucket name will be auto-prefixed with your tenant ID by the adapter so it stays isolated. Today the adapter accepts any token and bucket name (multi-tenancy enforcement is the next integration step).</p>
+  <table id="b-tbl" style="width:100%; font-size:12px; border-collapse:collapse;">
+    <thead><tr><th style="text-align:left;border-bottom:1px solid #30363d;padding:6px">Bucket</th><th style="border-bottom:1px solid #30363d;padding:6px">Repl</th><th style="text-align:left;border-bottom:1px solid #30363d;padding:6px">RAFT</th><th style="border-bottom:1px solid #30363d;padding:6px">Mirrors</th></tr></thead>
+    <tbody><tr><td colspan="4" class="meta">(click Refresh)</td></tr></tbody>
+  </table>
 </fieldset>
 
 <script>__NAV_JS__
@@ -403,16 +419,51 @@ if (!userKey()) {
   document.getElementById("signed-out").style.display = "block";
 } else {
   document.getElementById("info").style.display = "block";
+  document.getElementById("create-bucket").style.display = "block";
   document.getElementById("buckets").style.display = "block";
-  document.getElementById("t-id").textContent = userTenant() || "(unknown)";
-  document.getElementById("t-tag").textContent = "(set on signup)";
+  loadMe();
+  loadBuckets();
+}
+async function loadMe() {
+  const r = await authedFetch("/api/control/v1/me", { headers: {"Authorization": "Bearer " + userKey()} });
+  const j = await r.json();
+  document.getElementById("t-id").textContent = j.tenant_id || "(unknown)";
+  document.getElementById("t-tag").textContent = j.tag || "(no tag)";
+}
+async function createBucket() {
+  const body = {
+    name: document.getElementById("b-name").value.trim(),
+    replicas: parseInt(document.getElementById("b-replicas").value, 10),
+    geo: document.getElementById("b-geo").value,
+    want_mirrors: document.getElementById("b-mirrors").checked,
+    history: 8,
+  };
+  if (!body.name) { alert("name required"); return; }
+  const r = await authedFetch("/api/control/v1/me/buckets", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + userKey() },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json();
+  if (!r.ok) { document.getElementById("create-out").innerHTML = `<span class="err">${j.error||r.status}</span>`; return; }
+  document.getElementById("create-out").innerHTML = `<span class="ok">created ${j.bucket}</span> · ${(j.mirrors||[]).length} mirrors`;
+  document.getElementById("b-name").value = "";
   loadBuckets();
 }
 async function loadBuckets() {
+  const lr = await authedFetch("/api/control/v1/me/buckets", { headers: {"Authorization": "Bearer " + userKey()} });
+  const lj = await lr.json();
+  const names = new Set(lj.buckets || []);
   const r = await authedFetch("/api/nats/v1/admin/buckets");
   const j = await r.json();
-  const text = atob(j.body_b64 || "");
-  document.getElementById("buckets-out").textContent = text;
+  let payload;
+  try { payload = JSON.parse(atob(j.body_b64 || "")); } catch (e) { payload = j; }
+  const mine = (payload.buckets || []).filter(b => names.has(b.name));
+  const tb = document.getElementById("b-tbl").querySelector("tbody");
+  tb.innerHTML = mine.map(b => {
+    const peers = (b.peers||[]).map(p => p.name.replace('kv-','')).join(', ');
+    return `<tr><td style="padding:6px;border-bottom:1px solid #30363d">${b.name}</td><td style="text-align:center;padding:6px;border-bottom:1px solid #30363d">R${b.replicas}</td><td class="meta" style="padding:6px;border-bottom:1px solid #30363d">${peers}</td><td style="text-align:center;padding:6px;border-bottom:1px solid #30363d">${(b.mirrors||[]).length}</td></tr>`;
+  }).join("") || '<tr><td colspan="4" class="meta">(no buckets yet — create one above)</td></tr>';
 }
 </script>
 </body></html>
