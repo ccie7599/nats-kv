@@ -29,7 +29,7 @@ func NewStore(js nats.JetStreamContext, db *sql.DB) (*Store, error) {
 		Description: "tenant records, watched by adapters for live state",
 		History:     8,
 		Storage:     nats.FileStorage,
-		Replicas:    1,  // R1 — JetStream proxies cross-cluster reads via leader; R3 fails on init due to cluster placement constraints with hostPath leaves
+		Replicas:    1,  // R1 keeps the bucket on one peer; cluster mesh proxies reads/watches from any other peer. R3+ requires explicit JetStream placement tags — revisit.
 	})
 	if err != nil {
 		return nil, fmt.Errorf("tenants bucket: %w", err)
@@ -39,7 +39,7 @@ func NewStore(js nats.JetStreamContext, db *sql.DB) (*Store, error) {
 		Description: "API key hash records, watched by adapters",
 		History:     8,
 		Storage:     nats.FileStorage,
-		Replicas:    1,  // R1 — JetStream proxies cross-cluster reads via leader; R3 fails on init due to cluster placement constraints with hostPath leaves
+		Replicas:    1,  // R1 keeps the bucket on one peer; cluster mesh proxies reads/watches from any other peer. R3+ requires explicit JetStream placement tags — revisit.
 	})
 	if err != nil {
 		return nil, fmt.Errorf("keys bucket: %w", err)
