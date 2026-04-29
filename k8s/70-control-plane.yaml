@@ -1,0 +1,97 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: control-data
+  namespace: demo-nats-kv
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: linode-block-storage-retain
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kv-control
+  namespace: demo-nats-kv
+  labels:
+    app: kv-control
+    project: nats-kv
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: kv-control }
+  template:
+    metadata:
+      labels: { app: kv-control, project: nats-kv }
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "api"
+        vault.hashicorp.com/agent-inject-secret-admin-token: "api/data/nats-kv/control"
+        vault.hashicorp.com/agent-inject-template-admin-token: |
+          {{- with secret "api/data/nats-kv/control" -}}
+          {{ .Data.data.admin_token }}
+          {{- end -}}
+    spec:
+      serviceAccountName: app-vault-access
+      imagePullSecrets:
+        - name: harbor-creds
+      containers:
+        - name: control
+          image: harbor.harbor.svc.cluster.local/presales/nats-kv-control:v0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export ADMIN_TOKEN="$(cat /vault/secrets/admin-token)"
+              exec /usr/local/bin/kv-control
+          env:
+            - { name: LISTEN_ADDR,     value: ":8088" }
+            - { name: NATS_URL,        value: "nats://kv-adapter.demo-nats-kv.svc.cluster.local:4222" }
+            - { name: DB_PATH,         value: "/var/lib/nats-kv-control/control.db" }
+            - { name: PUBLIC_BASE_URL, value: "https://nats-kv-demo.connected-cloud.io" }
+          ports:
+            - { name: http, containerPort: 8088 }
+          readinessProbe:
+            httpGet: { path: /v1/health, port: 8088 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /v1/health, port: 8088 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/nats-kv-control }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: control-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kv-control
+  namespace: demo-nats-kv
+spec:
+  type: ClusterIP
+  selector: { app: kv-control }
+  ports:
+    - { name: http, port: 8088, targetPort: 8088 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kv-control-external
+  namespace: demo-nats-kv
+  annotations:
+    service.beta.kubernetes.io/linode-loadbalancer-throttle: "0"
+spec:
+  type: LoadBalancer
+  selector: { app: kv-control }
+  ports:
+    - { name: https, port: 443, targetPort: 8088, protocol: TCP }
