@@ -54,7 +54,7 @@ spec:
             - { name: TLS_KEY_FILE,    value: "/etc/tls/tls.key" }
             - { name: NATS_URL,        value: "nats://kv-adapter.demo-nats-kv.svc.cluster.local:4222" }
             - { name: DB_PATH,         value: "/var/lib/nats-kv-control/control.db" }
-            - { name: PUBLIC_BASE_URL, value: "https://nats-kv-demo.connected-cloud.io" }
+            - { name: PUBLIC_BASE_URL, value: "https://3c5be533-8e6d-423b-9962-87d9da8d16cd.fwf.app" }
           ports:
             - { name: http,  containerPort: 8088 }
             - { name: https, containerPort: 8443 }
