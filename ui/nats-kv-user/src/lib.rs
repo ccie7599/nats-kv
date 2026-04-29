@@ -1466,8 +1466,10 @@ curl -X PUT -H "Authorization: Bearer akv_demo_open" \
   <p>Run the placement engine without creating a bucket. Lets the dashboard preview the decision before you commit.</p>
 </div>
 
-<h2 id="sample">6. Sample Spin function (Rust)</h2>
-<p>Here's a Spin <code>wasi-http</code> handler that uses NATS-KV as a session store with subject-pattern lookup — something Cosmos can't express:</p>
+<h2 id="sample">6. Sample function code</h2>
+<p>Three idioms below — Rust (Spin function, the production deployment target), TypeScript (browser/Node fetch — Spin's JS SDK works the same), and Python (scripts, batch jobs, integration tests).</p>
+<h3>Rust (Spin function)</h3>
+<p>A Spin <code>wasi-http</code> handler that uses NATS-KV as a session store with subject-pattern lookup — something Cosmos can't express:</p>
 
 <pre><code>use spin_sdk::http::{IntoResponse, Method, Request, Response, send};
 use spin_sdk::http_component;
@@ -1520,8 +1522,111 @@ async fn handle_request(req: Request) -&gt; anyhow::Result&lt;impl IntoResponse&
 let resp: Response = send(req).await?;
 // resp body = the new counter value, atomic across all 27 regions.</code></pre>
 
+<h3>TypeScript (browser, Node, or Spin JS SDK)</h3>
+<p>The same session-store + wildcard-query pattern. Works unchanged in the browser (CORS is open on the data plane), in Node, and in a Spin JS function (the JS SDK exposes <code>fetch</code> through <code>wasi:http</code>):</p>
+
+<pre><code>const KV_BASE = "https://edge.nats-kv.connected-cloud.io";
+const KV_KEY  = process.env.KV_KEY;            // or Spin variable
+const BUCKET  = "your_tenant__sessions";
+
+async function recordSession(userId: string, sessionId: string) {
+  // Subject-pattern keys enable wildcard query later
+  const r = await fetch(`${KV_BASE}/v1/kv/${BUCKET}/users.${userId}.${sessionId}.session`, {
+    method: "PUT",
+    headers: { "Authorization": `Bearer ${KV_KEY}`, "Content-Type": "text/plain" },
+    body: "active",
+  });
+  if (!r.ok) throw new Error(`PUT failed: ${r.status}`);
+  const { revision } = await r.json();
+  return revision;
+}
+
+async function listUserSessions(userId: string): Promise&lt;string[]&gt; {
+  // Cosmos can't do this — it's exact-key only.
+  const r = await fetch(`${KV_BASE}/v1/kv/${BUCKET}/keys?match=users.${userId}.*.session`, {
+    headers: { "Authorization": `Bearer ${KV_KEY}` },
+  });
+  const { keys } = await r.json();
+  return keys ?? [];
+}
+
+// Atomic counter — safe under concurrent writers, no read-modify-write race.
+async function bumpCounter(name: string): Promise&lt;number&gt; {
+  const r = await fetch(`${KV_BASE}/v1/kv/${BUCKET}/counters.${name}/incr`, {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${KV_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ by: 1 }),
+  });
+  return Number(await r.text());
+}
+
+// Compare-and-swap: only update if the revision matches what we read.
+async function casUpdate(key: string, expectRev: number, newValue: string) {
+  const r = await fetch(`${KV_BASE}/v1/kv/${BUCKET}/${key}`, {
+    method: "PUT",
+    headers: {
+      "Authorization": `Bearer ${KV_KEY}`,
+      "Content-Type": "text/plain",
+      "If-Match": String(expectRev),
+    },
+    body: newValue,
+  });
+  if (r.status === 412) throw new Error("CAS conflict — somebody else updated first");
+  if (!r.ok) throw new Error(`PUT failed: ${r.status}`);
+}</code></pre>
+
+<h3>Python (scripts, batch jobs, integration tests)</h3>
+<p>Plain <code>requests</code>. Useful for backfills, audit scrapers, or wiring NATS-KV into a Python data pipeline:</p>
+
+<pre><code>import os, requests
+
+KV_BASE = "https://edge.nats-kv.connected-cloud.io"
+KV_KEY  = os.environ["KV_KEY"]
+BUCKET  = "your_tenant__sessions"
+H = {"Authorization": f"Bearer {KV_KEY}"}
+
+def put(key, value):
+    r = requests.put(f"{KV_BASE}/v1/kv/{BUCKET}/{key}", headers=H, data=value)
+    r.raise_for_status()
+    return r.json()["revision"]
+
+def get(key):
+    r = requests.get(f"{KV_BASE}/v1/kv/{BUCKET}/{key}", headers=H)
+    if r.status_code == 404: return None
+    r.raise_for_status()
+    return r.content
+
+def history(key):
+    """All retained revisions of a key (default depth = 8)."""
+    r = requests.get(f"{KV_BASE}/v1/kv/{BUCKET}/{key}/history", headers=H)
+    r.raise_for_status()
+    return r.json()  # [{"revision":N, "value_b64":"...", "created":"..."}, ...]
+
+def list_keys(pattern):
+    """Subject-pattern wildcard query — e.g., 'users.*.session'."""
+    r = requests.get(f"{KV_BASE}/v1/kv/{BUCKET}/keys",
+                     headers=H, params={"match": pattern})
+    r.raise_for_status()
+    return r.json()["keys"]
+
+def incr(key, by=1):
+    """Atomic counter — safe under concurrent writers."""
+    r = requests.post(f"{KV_BASE}/v1/kv/{BUCKET}/{key}/incr",
+                      headers={**H, "Content-Type": "application/json"},
+                      json={"by": by})
+    r.raise_for_status()
+    return int(r.text)
+
+# Example: bulk-tag every user that had a session in the last hour.
+recent = list_keys("users.*.session")
+print(f"{len(recent)} active sessions")
+for k in recent:
+    user = k.split(".")[1]
+    print(f"  {user} -> rev {put(f'tags.{user}.last_seen', 'recent')}")
+</code></pre>
+
 <div class="callout note">
-  <b>Spin runtime tip</b>: Spin's HTTP client (<code>wasi:http/outgoing-handler</code>) pools connections per function instance. The first call from a cold instance pays a TCP+TLS setup (~50-200ms); subsequent calls reuse the connection (~5-10ms). For latency-sensitive paths, do a no-op warmup at instance init.
+  <b>Spin runtime tip</b>: Spin's HTTP client (<code>wasi:http/outgoing-handler</code>) pools connections per function instance. The first call from a cold instance pays a TCP+TLS setup (~50-200ms); subsequent calls reuse the connection (~5-10ms). For latency-sensitive paths, do a no-op warmup at instance init. The same applies in reverse for the browser TS sample — keep-alive is per-tab.
 </div>
 
 <h2 id="unique">7. NATS-unique features (vs the Spin KV WIT)</h2>
