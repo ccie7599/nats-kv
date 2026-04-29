@@ -182,6 +182,18 @@ func (s *Server) createUserBucket(w http.ResponseWriter, r *http.Request, t *ten
 	}
 	_ = kv
 
+	// nats.go's CreateKeyValue only sets MirrorDirect=true when creating a
+	// mirror bucket, not when creating a source. Without it, mirrors of this
+	// source can't serve direct gets, which is the whole point of mirrors-
+	// everywhere. Update the source stream config to enable it.
+	srcStream := "KV_" + bucketName
+	if si, infoErr := s.js.StreamInfo(srcStream); infoErr == nil && si != nil && !si.Config.MirrorDirect {
+		patched := si.Config
+		patched.MirrorDirect = true
+		patched.AllowDirect = true
+		_, _ = s.js.UpdateStream(&patched)
+	}
+
 	// Per-region read mirrors. Default: mirror to every region the RAFT replicas
 	// don't already cover, so reads are local everywhere on the planet
 	// (eventual consistency; lag visible in the topology UI). Opt-out via

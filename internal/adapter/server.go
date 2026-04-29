@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -26,17 +27,64 @@ type Server struct {
 	mux     *http.ServeMux
 	started time.Time
 	keys    *KeyCache
+
+	mu             sync.RWMutex
+	localMirrorFor map[string]string // bucket -> KV_<bucket>_mirror_<region> on this node
 }
 
 func New(cfg Config) *Server {
 	s := &Server{
-		cfg:     cfg,
-		mux:     http.NewServeMux(),
-		started: time.Now(),
-		keys:    NewKeyCache(cfg.JS, cfg.DemoToken, cfg.ControlURL),
+		cfg:            cfg,
+		mux:            http.NewServeMux(),
+		started:        time.Now(),
+		keys:           NewKeyCache(cfg.JS, cfg.DemoToken, cfg.ControlURL),
+		localMirrorFor: map[string]string{},
 	}
 	s.routes()
+	go s.localMirrorRefreshLoop()
 	return s
+}
+
+// refreshLocalMirrors scans current streams for KV_<bucket>_mirror_<region>
+// matching this adapter's region and rebuilds the bucket->mirror map. Reads
+// then prefer the local mirror via DirectGet on its specific stream name —
+// without that, NATS distributes direct gets across all mirror replicas of the
+// source and reads land in arbitrary regions.
+func (s *Server) refreshLocalMirrors() {
+	suffix := "_mirror_" + s.cfg.Region
+	next := map[string]string{}
+	for sn := range s.cfg.JS.StreamNames() {
+		if !strings.HasPrefix(sn, "KV_") || !strings.HasSuffix(sn, suffix) {
+			continue
+		}
+		bucket := strings.TrimSuffix(strings.TrimPrefix(sn, "KV_"), suffix)
+		next[bucket] = sn
+	}
+	s.mu.Lock()
+	s.localMirrorFor = next
+	s.mu.Unlock()
+}
+
+func (s *Server) localMirrorRefreshLoop() {
+	// Tick fast until the meta layer has surfaced streams, then back off.
+	d := 2 * time.Second
+	for {
+		s.refreshLocalMirrors()
+		s.mu.RLock()
+		populated := len(s.localMirrorFor) > 0
+		s.mu.RUnlock()
+		if populated && d < 30*time.Second {
+			d = 30 * time.Second
+		}
+		time.Sleep(d)
+	}
+}
+
+func (s *Server) localMirrorName(bucket string) (string, bool) {
+	s.mu.RLock()
+	n, ok := s.localMirrorFor[bucket]
+	s.mu.RUnlock()
+	return n, ok
 }
 
 func (s *Server) Handler() http.Handler {
@@ -109,12 +157,19 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	info, _ := s.cfg.JS.AccountInfo()
+	s.mu.RLock()
+	mirrors := make(map[string]string, len(s.localMirrorFor))
+	for k, v := range s.localMirrorFor {
+		mirrors[k] = v
+	}
+	s.mu.RUnlock()
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"region":      s.cfg.Region,
-		"server":      s.cfg.NC.ConnectedServerName(),
-		"cluster":     s.cfg.NC.ConnectedClusterName(),
-		"account":     info,
-		"keys_loaded": s.keys.Size(),
+		"region":         s.cfg.Region,
+		"server":         s.cfg.NC.ConnectedServerName(),
+		"cluster":        s.cfg.NC.ConnectedClusterName(),
+		"account":        info,
+		"keys_loaded":    s.keys.Size(),
+		"local_mirrors":  mirrors,
 	})
 }
 
@@ -305,19 +360,52 @@ func (s *Server) ensureBucket(bucket string) (nats.KeyValue, error) {
 
 func (s *Server) kvGet(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	start := time.Now()
-	kv, err := s.ensureBucket(bucket)
-	if err != nil {
-		writeErr(w, err, http.StatusInternalServerError)
-		return
-	}
+
+	// Versioned reads go through the source — mirrors don't expose the same
+	// revision indexing path for arbitrary historical sequences.
 	if revStr := r.URL.Query().Get("revision"); revStr != "" {
+		kv, err := s.ensureBucket(bucket)
+		if err != nil {
+			writeErr(w, err, http.StatusInternalServerError)
+			return
+		}
 		rev, _ := strconv.ParseUint(revStr, 10, 64)
 		entry, err := kv.GetRevision(key, rev)
 		if err != nil {
 			writeErr(w, err, http.StatusNotFound)
 			return
 		}
+		w.Header().Set("X-Read-Source", "source")
 		writeEntry(w, entry, start)
+		return
+	}
+
+	// Latest read: address the local mirror by stream name so direct gets stay
+	// on this server. Without this, NATS load-balances direct gets across every
+	// mirror of the source and most reads land cross-region.
+	if mirrorName, ok := s.localMirrorName(bucket); ok {
+		subject := "$KV." + bucket + "." + key
+		msg, err := s.cfg.JS.GetLastMsg(mirrorName, subject, nats.DirectGet())
+		if err == nil {
+			if op := msg.Header.Get("KV-Operation"); op == "DEL" || op == "PURGE" {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("X-Read-Source", "local-mirror")
+			w.Header().Set("X-Read-Stream", mirrorName)
+			writeRawMsg(w, msg, start)
+			return
+		}
+		if errors.Is(err, nats.ErrMsgNotFound) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		// Other errors (transient API/timeout) — fall through to source.
+	}
+
+	kv, err := s.ensureBucket(bucket)
+	if err != nil {
+		writeErr(w, err, http.StatusInternalServerError)
 		return
 	}
 	entry, err := kv.Get(key)
@@ -329,7 +417,16 @@ func (s *Server) kvGet(w http.ResponseWriter, r *http.Request, bucket, key strin
 		writeErr(w, err, http.StatusInternalServerError)
 		return
 	}
+	w.Header().Set("X-Read-Source", "source")
 	writeEntry(w, entry, start)
+}
+
+func writeRawMsg(w http.ResponseWriter, m *nats.RawStreamMsg, start time.Time) {
+	w.Header().Set("X-Revision", strconv.FormatUint(m.Sequence, 10))
+	w.Header().Set("X-Latency-Ms", strconv.FormatInt(time.Since(start).Milliseconds(), 10))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("X-Created-At", m.Time.Format(time.RFC3339Nano))
+	_, _ = w.Write(m.Data)
 }
 
 func writeEntry(w http.ResponseWriter, entry nats.KeyValueEntry, start time.Time) {

@@ -210,6 +210,45 @@ Property names match primary hostnames per global CLAUDE.md convention. Three Ak
 
 ---
 
+## ADR-020 — Adapter reads address the local mirror by stream name (NATS direct-get load-balances; we need explicit local pinning)
+**Status**: Accepted (2026-04-29)
+
+**Context**: After per-region mirrors landed (one `KV_<bucket>_mirror_<region>` per non-RAFT region, 24+ mirrors per source bucket), reads from leaves still posted X-Latency-Ms of 130-380ms — same as before mirrors existed. The mirrors had the data (`stream subjects` showed `$KV.<bucket>.<key>` with count=1) and the local NATS server had a subscription on the source's direct-get subject (`$JS.API.DIRECT.GET.KV_<bucket>`), yet `msgs` on that sub stayed at 0 across multiple reads.
+
+**Two bugs found, both required for local reads:**
+
+1. **`MirrorDirect=false` on source streams.** `nats.go`'s `js.CreateKeyValue()` only sets `MirrorDirect=true` when creating a *mirror* bucket, not a *source* bucket (see `nats.go@v1.49.0/kv.go:469`). Without `MirrorDirect=true` on the source, mirrors never advertise themselves as direct-get servers for that source. Fix: control plane now does `UpdateStream` after `CreateKeyValue` to flip `MirrorDirect=true`. Existing demo buckets fixed manually with `nats stream edit --allow-mirror-direct`.
+
+2. **Direct gets to a source name don't prefer local mirrors.** Even after fixing (1) — and confirming local subs existed — direct-get requests sent to `$JS.API.DIRECT.GET.KV_<source>` get **load-balanced across all mirror servers cluster-wide**. We watched a request from a us-ord-attached client get answered by `KV_demo-r3-na_mirror_in-bom-2` (Mumbai) when both us-ord and ca-central had local mirrors. There is no "prefer local" affinity in NATS for direct gets across mirrors.
+
+**Decision**: Adapter now maintains a `bucket → KV_<bucket>_mirror_<region>` map (refreshed every 30s by scanning local stream names matching the suffix) and rewrites reads:
+
+- If a local mirror exists for `bucket`, call `js.GetLastMsg(localMirrorName, "$KV.<bucket>.<key>", nats.DirectGet())` — the request goes to `$JS.API.DIRECT.GET.<mirror-name>` which only the local mirror's server serves. **Sub-millisecond.**
+- Else fall back to `kv.Get(key)` against the source. **One cross-region hop** (50-80ms when reading from a non-local replica of the source RAFT).
+- Versioned reads (`?revision=N`) always go to the source.
+
+`X-Read-Source` (and `X-Read-Stream` when local) headers expose which path served — useful for the topology UI and for debugging future regressions.
+
+**Numbers (verified across all 26 leaves, intra-pod localhost test):**
+
+| Region group | X-Latency-Ms | X-Read-Source |
+|---|---|---|
+| 23 mirror regions (eu, ap, br, in, etc.) | **0-1 ms** | `local-mirror` |
+| 3 R3 RAFT regions for `KV_demo-r3-na` (us-west, us-sea, ca-central) | 53-81 ms | `source` |
+
+The 3 RAFT regions are by design — we skip mirroring on a region that already hosts a RAFT replica of the source (placement conflict). Reads there go to the 3-replica source RAFT; NATS picks one of the three replicas (sometimes local, often remote). Acceptable: those regions get strongly-consistent reads from the same RAFT cluster, and a future improvement could pin those reads to the local replica via `$JS.API.STREAM.MSG.GET.KV_<bucket>` with a per-server hint.
+
+**Why not just bind the KV API to the local mirror?** `nats.go` doesn't expose "bind KeyValue to mirror by name" — the `KeyValue(name)` lookup always resolves to the source stream. Re-exposing the mirror as a separate KV bucket would break the user's mental model (one bucket name, many physical streams). Reading via the low-level `GetLastMsg` keeps the public API ("PUT/GET on `bucket`") unchanged while routing reads locally.
+
+**Consequences**:
+- Mirrors-everywhere now actually delivers the local-read promise we made in ADR-008. Before this, mirrors only added cluster fan-out without serving requests.
+- Eventual consistency window stays as it was — replication lag is whatever NATS mirror replication takes (sub-second under normal load); the topology UI will surface it.
+- Adapter has 30s blind spot for new buckets (refresh cadence). Acceptable for create→read flows since the source still serves until the mirror is built; UI shows the transition.
+
+**Versions**: adapter `v0.2.1`, control `v0.1.9`. Rolled to all 27 nodes 2026-04-29.
+
+---
+
 ## ADR-019 — FWF→adapter calls use plain HTTP (TLS off the data plane); NATS-KV now beats Cosmos
 **Status**: Accepted (2026-04-29)
 
