@@ -100,6 +100,19 @@ fcaa907 feat: HTTP-poll keys from control plane (drops dependency on cross-clust
 
 1. **Open https://3c5be533-8e6d-423b-9962-87d9da8d16cd.fwf.app/topology** — should render 5 demo buckets as RAFT polygons + mirror dots over a world map. Click each bucket on the left to see its consistency domain visualized.
 2. **Open /play** — playground works without sign-in (uses shared demo token). Try the subject-wildcard demo (now correctly returns 5 `users.*.session` keys).
-3. **Issue an invite from /admin app, claim it, sign in, retry the playground** — your tenant key is now accepted by all 27 adapters (the original 401 bug is dead).
+3. **Open admin app, issue an invite, click the URL, claim it, then visit /dash on the user app** — paste the key, create your own bucket with placement of choice + mirrors, see it appear in your dashboard table.
 
-If anything looks off, MORNING_STATUS notes give the context, and the git log tells the story.
+End-to-end test I just ran (sample output, ~10s of automated curl):
+```
+1. admin creates invite        → URL minted
+2. tester claims               → tenant t_84327ed3… + key akv_int_f4d46b3151…
+3. /v1/me                      → tenant_id, tag returned
+4. POST /v1/me/buckets         → bucket=t_84327ed3…__verify  R3 in NA + 3 mirrors
+5. PUT k1 via us-ord adapter   → revision 1
+6. GET k1 from 5 regions       → us-ord, eu-central, jp-tyo-3, br-gru, us-east all return "verified"
+   (cross-continent reads served from local mirrors — the consistency-domain pattern visible in /topology)
+```
+
+**Known limitation (v0.1):** another tenant's API key can still read your bucket (HTTP 200) because the adapter doesn't yet enforce per-tenant prefix isolation. Will tighten in v0.6 with adapter prefix-rewrite based on bearer→tenant.
+
+If anything looks off, the sections above give the context, and the git log tells the story.
