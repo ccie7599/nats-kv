@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -61,6 +62,7 @@ func (s *Server) routes() {
 	// Internal — adapters poll for active key list. Open to all (returns hashes,
 	// not plaintexts; nodes share an L7 firewall envelope).
 	s.mux.HandleFunc("/v1/internal/keys", s.internalKeysHandler)
+	s.mux.HandleFunc("/v1/internal/buckets/ensure", s.internalEnsureBucketHandler)
 
 	// User self-service — bearer = user API key
 	s.mux.HandleFunc("/v1/me", s.userOnly(s.meHandler))
@@ -216,13 +218,6 @@ func (s *Server) createUserBucket(w http.ResponseWriter, r *http.Request, t *ten
 	}
 
 	bucketName := t.ID + "__" + req.Name
-	cfg := &nats.KeyValueConfig{
-		Bucket:      bucketName,
-		History:     req.History,
-		Storage:     nats.FileStorage,
-		Replicas:    req.Replicas,
-		Description: "tenant=" + t.ID + " name=" + req.Name,
-	}
 
 	// Resolve placement. Decision is non-nil when the engine ran (auto/anchor
 	// modes) and is returned in the response so the UI can render the "why."
@@ -231,60 +226,12 @@ func (s *Server) createUserBucket(w http.ResponseWriter, r *http.Request, t *ten
 		writeJSON(w, 400, map[string]any{"error": placementErr.Error()})
 		return
 	}
-	if decision != nil && decision.PlacementTag != "" {
-		cfg.Placement = &nats.Placement{Tags: []string{decision.PlacementTag}}
-	}
 
-	kv, err := s.js.CreateKeyValue(cfg)
+	mirrors, err := s.materializeBucket(bucketName, req.Replicas, req.History, decision, !req.NoMirrors,
+		"tenant="+t.ID+" name="+req.Name)
 	if err != nil {
-		writeJSON(w, 500, map[string]any{"error": "create bucket: " + err.Error()})
+		writeJSON(w, 500, map[string]any{"error": err.Error()})
 		return
-	}
-	_ = kv
-
-	// nats.go's CreateKeyValue only sets MirrorDirect=true when creating a
-	// mirror bucket, not when creating a source. Without it, mirrors of this
-	// source can't serve direct gets, which is the whole point of mirrors-
-	// everywhere. Update the source stream config to enable it.
-	srcStream := "KV_" + bucketName
-	if si, infoErr := s.js.StreamInfo(srcStream); infoErr == nil && si != nil && !si.Config.MirrorDirect {
-		patched := si.Config
-		patched.MirrorDirect = true
-		patched.AllowDirect = true
-		_, _ = s.js.UpdateStream(&patched)
-	}
-
-	// Per-region read mirrors. Default: mirror to every region the RAFT replicas
-	// don't already cover, so reads are local everywhere on the planet
-	// (eventual consistency; lag visible in the topology UI). Opt-out via
-	// no_mirrors=true.
-	mirrors := []string{}
-	if !req.NoMirrors {
-		// Skip regions that already host a RAFT replica; we'd just be making
-		// JetStream confused / placement-conflicting if we tried.
-		raftRegions, err := s.streamRegions("KV_" + bucketName)
-		if err != nil {
-			s.store.Audit(r.Context(), t.ID, "bucket.create.warn", "bucket", bucketName, "raft regions: "+err.Error())
-		}
-		for _, region := range allRegions {
-			if raftRegions[region] {
-				continue
-			}
-			mirrorName := "KV_" + bucketName + "_mirror_" + region
-			_, err := s.js.AddStream(&nats.StreamConfig{
-				Name:         mirrorName,
-				Mirror:       &nats.StreamSource{Name: "KV_" + bucketName},
-				Storage:      nats.FileStorage,
-				Placement:    &nats.Placement{Tags: []string{"region:" + region}},
-				Replicas:     1,
-				AllowDirect:  true,
-				MirrorDirect: true,
-				Duplicates:   2 * time.Minute,
-			})
-			if err == nil {
-				mirrors = append(mirrors, mirrorName)
-			}
-		}
 	}
 
 	auditMsg := req.Geo
@@ -307,6 +254,152 @@ func (s *Server) createUserBucket(w http.ResponseWriter, r *http.Request, t *ten
 		resp["placement"] = decision
 	}
 	writeJSON(w, 200, resp)
+}
+
+// materializeBucket creates a KV source (with placement from decision if any)
+// and, when withMirrors=true, fans out per-region mirror streams to every
+// region the source's RAFT doesn't already cover. Idempotent on the source —
+// if it already exists, mirrors are still ensured. Returns the list of mirror
+// stream names created (or already present).
+func (s *Server) materializeBucket(bucketName string, replicas int, history uint8, decision *placement.Decision, withMirrors bool, description string) ([]string, error) {
+	cfg := &nats.KeyValueConfig{
+		Bucket:      bucketName,
+		History:     history,
+		Storage:     nats.FileStorage,
+		Replicas:    replicas,
+		Description: description,
+	}
+	if decision != nil && decision.PlacementTag != "" {
+		cfg.Placement = &nats.Placement{Tags: []string{decision.PlacementTag}}
+	}
+
+	if _, err := s.js.CreateKeyValue(cfg); err != nil {
+		// Idempotency: if the bucket exists already, don't fail — drop through
+		// to mirror reconciliation.
+		if !errors.Is(err, nats.ErrStreamNameAlreadyInUse) {
+			return nil, fmt.Errorf("create bucket: %w", err)
+		}
+	}
+
+	// nats.go's CreateKeyValue only sets MirrorDirect=true when creating a
+	// mirror bucket, not when creating a source. Without it, mirrors of this
+	// source can't serve direct gets, which is the whole point of mirrors-
+	// everywhere. Update the source stream config to enable it.
+	srcStream := "KV_" + bucketName
+	if si, infoErr := s.js.StreamInfo(srcStream); infoErr == nil && si != nil && !si.Config.MirrorDirect {
+		patched := si.Config
+		patched.MirrorDirect = true
+		patched.AllowDirect = true
+		_, _ = s.js.UpdateStream(&patched)
+	}
+
+	mirrors := []string{}
+	if !withMirrors {
+		return mirrors, nil
+	}
+	raftRegions, _ := s.streamRegions(srcStream)
+	for _, region := range allRegions {
+		if raftRegions[region] {
+			continue
+		}
+		mirrorName := srcStream + "_mirror_" + region
+		_, err := s.js.AddStream(&nats.StreamConfig{
+			Name:         mirrorName,
+			Mirror:       &nats.StreamSource{Name: srcStream},
+			Storage:      nats.FileStorage,
+			Placement:    &nats.Placement{Tags: []string{"region:" + region}},
+			Replicas:     1,
+			AllowDirect:  true,
+			MirrorDirect: true,
+			Duplicates:   2 * time.Minute,
+		})
+		if err == nil || errors.Is(err, nats.ErrStreamNameAlreadyInUse) {
+			mirrors = append(mirrors, mirrorName)
+		}
+	}
+	return mirrors, nil
+}
+
+// internalEnsureBucketHandler is called by adapters when they see a request for
+// a bucket that doesn't exist locally. The adapter passes its own region as
+// `anchor` so placement runs from the caller's perspective — the bucket lands
+// in the geo nearest to whoever first hit the playground.
+//
+// Restricted to a name allow-list to prevent random /v1/kv/<garbage>/key calls
+// from spawning long-lived streams. No tenancy involvement (these are shared
+// demo buckets).
+func (s *Server) internalEnsureBucketHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name        string `json:"name"`
+		Anchor      string `json:"anchor"`
+		Replicas    int    `json:"replicas"`
+		History     uint8  `json:"history"`
+		WithMirrors bool   `json:"with_mirrors"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]any{"error": "bad json"})
+		return
+	}
+	if !isAutoCreatableBucket(req.Name) {
+		writeJSON(w, 400, map[string]any{"error": "bucket name not on auto-create allow-list"})
+		return
+	}
+	if req.Replicas == 0 {
+		req.Replicas = 3
+	}
+	if req.History == 0 {
+		req.History = 8
+	}
+	if req.Anchor == "" {
+		req.Anchor = "us-ord"
+	}
+
+	// Already exists? Idempotent return.
+	if _, err := s.js.StreamInfo("KV_" + req.Name); err == nil {
+		writeJSON(w, 200, map[string]any{"bucket": req.Name, "status": "exists"})
+		return
+	}
+
+	if s.placer == nil {
+		writeJSON(w, 503, map[string]any{"error": "placement engine not configured"})
+		return
+	}
+	d, err := s.placer.Pick(r.Context(), req.Replicas, req.Anchor, "auto")
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"error": "placement: " + err.Error()})
+		return
+	}
+
+	mirrors, err := s.materializeBucket(req.Name, req.Replicas, req.History, d, req.WithMirrors,
+		"shared demo bucket; auto-placed from anchor "+req.Anchor)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		return
+	}
+	s.store.Audit(r.Context(), "internal", "bucket.ensure", "bucket", req.Name, "anchor="+req.Anchor+" geo="+d.ChosenGeo)
+	writeJSON(w, 200, map[string]any{
+		"bucket":       req.Name,
+		"status":       "created",
+		"placement":    d,
+		"mirrors":      mirrors,
+		"mirror_count": len(mirrors),
+	})
+}
+
+// isAutoCreatableBucket gates which names the adapter can ask the control plane
+// to auto-create. Tenant-prefixed buckets must go through /v1/me/buckets so we
+// can charge them to a real tenant; only bare shared demo buckets are eligible
+// for the on-first-access flow.
+func isAutoCreatableBucket(name string) bool {
+	switch name {
+	case "demo":
+		return true
+	}
+	return false
 }
 
 // resolvePlacement reads the createBucketReq's geo/anchor fields and produces

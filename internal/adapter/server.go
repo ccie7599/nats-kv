@@ -349,13 +349,45 @@ func (s *Server) ensureBucket(bucket string) (nats.KeyValue, error) {
 	if !errors.Is(err, nats.ErrBucketNotFound) {
 		return nil, err
 	}
-	return s.cfg.JS.CreateKeyValue(&nats.KeyValueConfig{
-		Bucket:      bucket,
-		History:     8,
-		Storage:     nats.FileStorage,
-		Replicas:    1,
-		Description: "auto-created bucket",
+	// Ask the control plane to create the bucket using *this adapter's* region
+	// as the placement anchor. The control plane runs the placement engine and
+	// fans out per-region mirrors — so the demo bucket lands near whoever first
+	// hit it, with read locality everywhere. R1 auto-creates were the prior
+	// behavior; they pinned demo data to whichever peer JetStream picked,
+	// which is how we ended up with a Japan-resident `demo` bucket after the
+	// 2026-04-29 cluster wipe (see ADR-022 / ADR-023).
+	if err := s.requestBucketEnsure(bucket); err != nil {
+		return nil, fmt.Errorf("ensure bucket via control plane: %w", err)
+	}
+	return s.cfg.JS.KeyValue(bucket)
+}
+
+// requestBucketEnsure POSTs to the control plane's internal ensure endpoint,
+// passing the local adapter region as the placement anchor.
+func (s *Server) requestBucketEnsure(bucket string) error {
+	if s.cfg.ControlURL == "" {
+		return errors.New("control URL not configured")
+	}
+	body, _ := json.Marshal(map[string]any{
+		"name":         bucket,
+		"anchor":       s.cfg.Region,
+		"replicas":     3,
+		"history":      8,
+		"with_mirrors": true,
 	})
+	req, _ := http.NewRequest(http.MethodPost, s.cfg.ControlURL+"/v1/internal/buckets/ensure", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	cli := &http.Client{Timeout: 30 * time.Second} // mirror fan-out is 24 stream creates; allow time
+	resp, err := cli.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("control plane %d: %s", resp.StatusCode, string(b))
+	}
+	return nil
 }
 
 func (s *Server) kvGet(w http.ResponseWriter, r *http.Request, bucket, key string) {
