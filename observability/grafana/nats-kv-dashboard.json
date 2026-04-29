@@ -1,0 +1,190 @@
+{
+  "uid": "nats-kv",
+  "title": "NATS-KV — demo + admin (DS2)",
+  "description": "Akamai DS2 logs for the nats-kv property (covers both demo and admin hostnames). Populates once the Akamai property is activated and DS2 stream begins delivering.",
+  "tags": ["nats-kv", "ds2", "presales-landing-zone"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "host",
+        "type": "custom",
+        "label": "hostname",
+        "query": "All : .* , Demo : nats-kv\\.connected-cloud\\.io , Admin : nats-kv-admin\\.connected-cloud\\.io",
+        "current": { "text": "All", "value": ".*" },
+        "options": [
+          { "text": "All",   "value": ".*",                              "selected": true },
+          { "text": "Demo",  "value": "nats-kv\\.connected-cloud\\.io",  "selected": false },
+          { "text": "Admin", "value": "nats-kv-admin\\.connected-cloud\\.io", "selected": false }
+        ]
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Overview",
+      "gridPos": { "x":0, "y":0, "w":24, "h":1 }
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Total requests",
+      "gridPos": { "x":0, "y":1, "w":4, "h":4 },
+      "datasource": { "type":"grafana-clickhouse-datasource", "uid":"clickhouse" },
+      "options": { "reduceOptions":{"values":false,"calcs":["lastNotNull"]}, "colorMode":"value" },
+      "fieldConfig": { "defaults": { "color": {"mode":"thresholds"}, "thresholds": {"mode":"absolute","steps":[{"color":"green","value":null}]} } },
+      "targets": [
+        { "refId": "A", "rawSql": "SELECT count() FROM default.ds2_raw WHERE match(reqHost, '^${host}$') AND timestamp >= $__fromTime AND timestamp <= $__toTime" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Total bytes served",
+      "gridPos": { "x":4, "y":1, "w":4, "h":4 },
+      "datasource": { "type":"grafana-clickhouse-datasource", "uid":"clickhouse" },
+      "options": { "reduceOptions":{"values":false,"calcs":["lastNotNull"]}, "colorMode":"value" },
+      "fieldConfig": { "defaults": { "unit":"bytes" } },
+      "targets": [
+        { "refId": "A", "rawSql": "SELECT sum(bytes) FROM default.ds2_raw WHERE match(reqHost, '^${host}$') AND timestamp >= $__fromTime AND timestamp <= $__toTime" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Unique edge IPs",
+      "gridPos": { "x":8, "y":1, "w":4, "h":4 },
+      "datasource": { "type":"grafana-clickhouse-datasource", "uid":"clickhouse" },
+      "options": { "reduceOptions":{"values":false,"calcs":["lastNotNull"]}, "colorMode":"value" },
+      "targets": [
+        { "refId": "A", "rawSql": "SELECT uniq(edgeIP) FROM default.ds2_raw WHERE match(reqHost, '^${host}$') AND timestamp >= $__fromTime AND timestamp <= $__toTime" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "gauge",
+      "title": "Cache hit rate",
+      "gridPos": { "x":12, "y":1, "w":4, "h":4 },
+      "datasource": { "type":"grafana-clickhouse-datasource", "uid":"clickhouse" },
+      "fieldConfig": { "defaults": { "unit":"percent", "min":0, "max":100, "thresholds":{"mode":"absolute","steps":[{"color":"red","value":null},{"color":"yellow","value":40},{"color":"green","value":75}]}}},
+      "targets": [
+        { "refId": "A", "rawSql": "SELECT if(count() > 0, countIf(cacheStatus IN ('1','TCP_HIT','TCP_MEM_HIT','TCP_IMS_HIT')) * 100.0 / count(), 0) FROM default.ds2_raw WHERE match(reqHost, '^${host}$') AND timestamp >= $__fromTime AND timestamp <= $__toTime" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "gauge",
+      "title": "Error rate (4xx + 5xx)",
+      "gridPos": { "x":16, "y":1, "w":4, "h":4 },
+      "datasource": { "type":"grafana-clickhouse-datasource", "uid":"clickhouse" },
+      "fieldConfig": { "defaults": { "unit":"percent", "min":0, "max":50, "thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"yellow","value":2},{"color":"red","value":10}]}}},
+      "targets": [
+        { "refId": "A", "rawSql": "SELECT if(count() > 0, countIf(statusCode >= 400) * 100.0 / count(), 0) FROM default.ds2_raw WHERE match(reqHost, '^${host}$') AND timestamp >= $__fromTime AND timestamp <= $__toTime" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Avg response size",
+      "gridPos": { "x":20, "y":1, "w":4, "h":4 },
+      "datasource": { "type":"grafana-clickhouse-datasource", "uid":"clickhouse" },
+      "fieldConfig": { "defaults": { "unit":"bytes" } },
+      "targets": [
+        { "refId": "A", "rawSql": "SELECT avg(bytes) FROM default.ds2_raw WHERE match(reqHost, '^${host}$') AND timestamp >= $__fromTime AND timestamp <= $__toTime" }
+      ]
+    },
+
+    { "type": "row", "title": "Traffic over time", "gridPos": { "x":0, "y":5, "w":24, "h":1 } },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Requests / 5m, by hostname (demo vs admin)",
+      "gridPos": { "x":0, "y":6, "w":12, "h":8 },
+      "datasource": { "type":"grafana-clickhouse-datasource", "uid":"clickhouse" },
+      "fieldConfig": { "defaults": {"unit":"short"} },
+      "targets": [
+        { "refId": "A", "rawSql": "SELECT toStartOfInterval(timestamp, INTERVAL 5 MINUTE) AS time, reqHost AS metric, count() AS requests FROM default.ds2_raw WHERE match(reqHost, '^${host}$') AND match(reqHost, 'nats-kv') AND timestamp >= $__fromTime AND timestamp <= $__toTime GROUP BY time, reqHost ORDER BY time" }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Status codes / 5m (stacked)",
+      "gridPos": { "x":12, "y":6, "w":12, "h":8 },
+      "datasource": { "type":"grafana-clickhouse-datasource", "uid":"clickhouse" },
+      "fieldConfig": { "defaults": {"custom": {"stacking": {"mode":"normal"}}, "unit":"short"} },
+      "targets": [
+        { "refId": "A", "rawSql": "SELECT toStartOfInterval(timestamp, INTERVAL 5 MINUTE) AS time, multiIf(statusCode<300,'2xx',statusCode<400,'3xx',statusCode<500,'4xx','5xx') AS metric, count() AS requests FROM default.ds2_raw WHERE match(reqHost, '^${host}$') AND match(reqHost, 'nats-kv') AND timestamp >= $__fromTime AND timestamp <= $__toTime GROUP BY time, metric ORDER BY time" }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Bytes / 5m",
+      "gridPos": { "x":0, "y":14, "w":12, "h":8 },
+      "datasource": { "type":"grafana-clickhouse-datasource", "uid":"clickhouse" },
+      "fieldConfig": { "defaults": {"unit":"bytes"} },
+      "targets": [
+        { "refId": "A", "rawSql": "SELECT toStartOfInterval(timestamp, INTERVAL 5 MINUTE) AS time, sum(bytes) AS bytes FROM default.ds2_raw WHERE match(reqHost, '^${host}$') AND match(reqHost, 'nats-kv') AND timestamp >= $__fromTime AND timestamp <= $__toTime GROUP BY time ORDER BY time" }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Cache HIT vs MISS / 5m",
+      "gridPos": { "x":12, "y":14, "w":12, "h":8 },
+      "datasource": { "type":"grafana-clickhouse-datasource", "uid":"clickhouse" },
+      "fieldConfig": { "defaults": {"custom":{"stacking":{"mode":"normal"}}, "unit":"short"} },
+      "targets": [
+        { "refId": "A", "rawSql": "SELECT toStartOfInterval(timestamp, INTERVAL 5 MINUTE) AS time, if(cacheStatus IN ('1','TCP_HIT','TCP_MEM_HIT','TCP_IMS_HIT'),'HIT','MISS') AS metric, count() AS requests FROM default.ds2_raw WHERE match(reqHost, '^${host}$') AND match(reqHost, 'nats-kv') AND timestamp >= $__fromTime AND timestamp <= $__toTime GROUP BY time, metric ORDER BY time" }
+      ]
+    },
+
+    { "type": "row", "title": "Breakdowns", "gridPos": { "x":0, "y":22, "w":24, "h":1 } },
+    {
+      "id": 20,
+      "type": "table",
+      "title": "Top URL paths",
+      "gridPos": { "x":0, "y":23, "w":12, "h":10 },
+      "datasource": { "type":"grafana-clickhouse-datasource", "uid":"clickhouse" },
+      "targets": [
+        { "refId": "A", "rawSql": "SELECT reqPath AS path, count() AS hits, sum(bytes) AS bytes, countIf(statusCode>=400) AS errors FROM default.ds2_raw WHERE match(reqHost, '^${host}$') AND match(reqHost, 'nats-kv') AND timestamp >= $__fromTime AND timestamp <= $__toTime GROUP BY reqPath ORDER BY hits DESC LIMIT 25" }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "table",
+      "title": "Status code detail",
+      "gridPos": { "x":12, "y":23, "w":12, "h":10 },
+      "datasource": { "type":"grafana-clickhouse-datasource", "uid":"clickhouse" },
+      "targets": [
+        { "refId": "A", "rawSql": "SELECT statusCode, count() AS hits, sum(bytes) AS bytes FROM default.ds2_raw WHERE match(reqHost, '^${host}$') AND match(reqHost, 'nats-kv') AND timestamp >= $__fromTime AND timestamp <= $__toTime GROUP BY statusCode ORDER BY hits DESC LIMIT 25" }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "table",
+      "title": "Top edge client IPs",
+      "gridPos": { "x":0, "y":33, "w":12, "h":8 },
+      "datasource": { "type":"grafana-clickhouse-datasource", "uid":"clickhouse" },
+      "targets": [
+        { "refId": "A", "rawSql": "SELECT edgeIP, count() AS hits, sum(bytes) AS bytes FROM default.ds2_raw WHERE match(reqHost, '^${host}$') AND match(reqHost, 'nats-kv') AND timestamp >= $__fromTime AND timestamp <= $__toTime GROUP BY edgeIP ORDER BY hits DESC LIMIT 25" }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "table",
+      "title": "Demo vs Admin split (last full window)",
+      "gridPos": { "x":12, "y":33, "w":12, "h":8 },
+      "datasource": { "type":"grafana-clickhouse-datasource", "uid":"clickhouse" },
+      "targets": [
+        { "refId": "A", "rawSql": "SELECT reqHost AS host, count() AS hits, sum(bytes) AS bytes, countIf(statusCode>=500) AS srv_errors, countIf(cacheStatus IN ('1','TCP_HIT','TCP_MEM_HIT','TCP_IMS_HIT')) AS cache_hits FROM default.ds2_raw WHERE match(reqHost, 'nats-kv') AND timestamp >= $__fromTime AND timestamp <= $__toTime GROUP BY reqHost ORDER BY hits DESC" }
+      ]
+    }
+  ]
+}
