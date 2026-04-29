@@ -1,0 +1,23 @@
+# Wildcard Certificate for *.nats-kv.connected-cloud.io and apex.
+# Issued by cert-manager via the LZ's letsencrypt-prod ClusterIssuer (Akamai DNS-01).
+# The resulting Secret `nats-kv-tls` is consumed by the LZ adapter directly and
+# synced to all leaf clusters by `scripts/sync-cert-to-leaves.sh` (60-day cadence).
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: nats-kv-wildcard
+  namespace: demo-nats-kv
+spec:
+  secretName: nats-kv-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  commonName: nats-kv.connected-cloud.io
+  dnsNames:
+    - "nats-kv.connected-cloud.io"
+    - "*.nats-kv.connected-cloud.io"
+  duration: 2160h     # 90 days
+  renewBefore: 720h   # 30 days
+  privateKey:
+    algorithm: ECDSA
+    size: 256

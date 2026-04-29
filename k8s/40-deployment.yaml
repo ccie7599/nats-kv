@@ -38,7 +38,7 @@ spec:
       # Read DEMO_TOKEN from Vault-injected file at startup
       containers:
         - name: adapter
-          image: harbor.harbor.svc.cluster.local/presales/nats-kv-adapter:v0.1.1
+          image: harbor.harbor.svc.cluster.local/presales/nats-kv-adapter:v0.1.2
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -52,28 +52,37 @@ spec:
               value: ":8080"
             - name: JETSTREAM_DIR
               value: "/var/lib/nats/jetstream"
-            # KV NATS uses +10 from defaults to avoid conflicting with the latency
-            # project's NATS mesh that already binds 4222/6222/8222 on every cluster.
+            # NATS standard ports — LZ pod is on cluster-internal network so no
+            # collision with the latency-hub on hostNetwork. Leaf KV nodes are
+            # dedicated (`tier=kv` taint) so also free of the latency 4222/6222.
             - name: NATS_CLIENT_PORT
-              value: "4232"
+              value: "4222"
             - name: NATS_CLUSTER_PORT
-              value: "6232"
+              value: "6222"
             - name: NATS_MONITOR_PORT
-              value: "8232"
-            # NATS cluster mesh seed. LZ self-routes (NATS dedups self) to satisfy
-            # JetStream's requirement of being part of a cluster on boot. Leaves
-            # gossip-discover other peers via this seed.
+              value: "8222"
+            # Self-route satisfies JetStream's "must be part of a cluster" boot check.
+            # Leaves gossip-discover other peers via this seed.
             - name: NATS_ROUTES
-              value: "nats-route://us-ord.nats-kv.connected-cloud.io:6232"
+              value: "nats-route://us-ord.nats-kv.connected-cloud.io:6222"
+            # TLS — wildcard cert from cert-manager
+            - name: LISTEN_TLS_ADDR
+              value: ":8443"
+            - name: TLS_CERT_FILE
+              value: "/etc/tls/tls.crt"
+            - name: TLS_KEY_FILE
+              value: "/etc/tls/tls.key"
           ports:
             - name: http
               containerPort: 8080
+            - name: https
+              containerPort: 8443
             - name: nats-client
-              containerPort: 4232
+              containerPort: 4222
             - name: nats-cluster
-              containerPort: 6232
+              containerPort: 6222
             - name: nats-monitor
-              containerPort: 8232
+              containerPort: 8222
           readinessProbe:
             httpGet:
               path: /v1/health
@@ -96,7 +105,13 @@ spec:
           volumeMounts:
             - name: jetstream
               mountPath: /var/lib/nats/jetstream
+            - name: tls
+              mountPath: /etc/tls
+              readOnly: true
       volumes:
         - name: jetstream
           persistentVolumeClaim:
             claimName: jetstream-data
+        - name: tls
+          secret:
+            secretName: nats-kv-tls

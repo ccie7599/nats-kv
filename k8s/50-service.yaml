@@ -8,23 +8,15 @@ spec:
   selector:
     app: kv-adapter
   ports:
-    - name: http
-      port: 8080
-      targetPort: 8080
-    - name: nats-client
-      port: 4232
-      targetPort: 4232
-    - name: nats-cluster
-      port: 6232
-      targetPort: 6232
-    - name: nats-monitor
-      port: 8232
-      targetPort: 8232
+    - { name: http,         port: 8080, targetPort: 8080 }
+    - { name: https,        port: 8443, targetPort: 8443 }
+    - { name: nats-client,  port: 4222, targetPort: 4222 }
+    - { name: nats-cluster, port: 6222, targetPort: 6222 }
+    - { name: nats-monitor, port: 8222, targetPort: 8222 }
 ---
-# External LoadBalancer (NodeBalancer) for the LZ (us-ord) cluster.
-# Leaves use hostNetwork+hostPort directly (one node per leaf). This NB carries
-# both the HTTP API (port 80) and the NATS cluster mesh ingress (port 6232) so
-# leaves can dial back into us-ord as a seed.
+# External LoadBalancer for the LZ. Leaves use hostNetwork on dedicated KV nodes
+# directly. NB carries the HTTP API (80→8080), HTTPS (443→8443), and the NATS
+# cluster mesh ingress (6222) so leaves can dial back into us-ord as a seed.
 apiVersion: v1
 kind: Service
 metadata:
@@ -37,11 +29,6 @@ spec:
   selector:
     app: kv-adapter
   ports:
-    - name: http
-      port: 80
-      targetPort: 8080
-      protocol: TCP
-    - name: nats-cluster
-      port: 6232
-      targetPort: 6232
-      protocol: TCP
+    - { name: http,         port: 80,   targetPort: 8080, protocol: TCP }
+    - { name: https,        port: 443,  targetPort: 8443, protocol: TCP }
+    - { name: nats-cluster, port: 6222, targetPort: 6222, protocol: TCP }

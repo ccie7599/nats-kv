@@ -17,16 +17,23 @@ spec:
         project: nats-kv
       annotations:
         prometheus.io/scrape: "true"
-        prometheus.io/port: "8232"
+        prometheus.io/port: "8222"
         prometheus.io/path: "/varz"
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        tier: kv
+      tolerations:
+        - key: tier
+          operator: Equal
+          value: kv
+          effect: NoSchedule
       imagePullSecrets:
         - name: harbor-creds
       containers:
         - name: adapter
-          image: harbor.connected-cloud.io/presales/nats-kv-adapter:v0.1.1
+          image: harbor.connected-cloud.io/presales/nats-kv-adapter:v0.1.2
           imagePullPolicy: IfNotPresent
           env:
             - name: REGION
@@ -37,53 +44,49 @@ spec:
                 secretKeyRef: { name: kv-config, key: demo_token }
             - name: LISTEN_ADDR
               value: ":8080"
+            - name: LISTEN_TLS_ADDR
+              value: ":8443"
+            - name: TLS_CERT_FILE
+              value: "/etc/tls/tls.crt"
+            - name: TLS_KEY_FILE
+              value: "/etc/tls/tls.key"
             - name: JETSTREAM_DIR
               value: "/var/lib/nats/jetstream"
             - name: NATS_CLIENT_PORT
-              value: "4232"
+              value: "4222"
             - name: NATS_CLUSTER_PORT
-              value: "6232"
+              value: "6222"
             - name: NATS_MONITOR_PORT
-              value: "8232"
-            # Bootstrap mesh by dialing us-ord. NATS gossip discovers the rest.
+              value: "8222"
             - name: NATS_ROUTES
-              value: "nats-route://us-ord.nats-kv.connected-cloud.io:6232"
+              value: "nats-route://us-ord.nats-kv.connected-cloud.io:6222"
           ports:
-            - name: http
-              containerPort: 8080
-              hostPort: 8080
-            - name: nats-client
-              containerPort: 4232
-              hostPort: 4232
-            - name: nats-cluster
-              containerPort: 6232
-              hostPort: 6232
-            - name: nats-monitor
-              containerPort: 8232
-              hostPort: 8232
+            - { name: http,         containerPort: 8080, hostPort: 8080 }
+            - { name: https,        containerPort: 8443, hostPort: 443 }
+            - { name: nats-client,  containerPort: 4222, hostPort: 4222 }
+            - { name: nats-cluster, containerPort: 6222, hostPort: 6222 }
+            - { name: nats-monitor, containerPort: 8222, hostPort: 8222 }
           readinessProbe:
-            httpGet:
-              path: /v1/health
-              port: 8080
+            httpGet: { path: /v1/health, port: 8080 }
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
-            httpGet:
-              path: /v1/health
-              port: 8080
+            httpGet: { path: /v1/health, port: 8080 }
             initialDelaySeconds: 30
             periodSeconds: 30
           resources:
-            requests: { cpu: 100m, memory: 128Mi }
-            limits:   { cpu: 1000m, memory: 768Mi }
+            requests: { cpu: 200m, memory: 256Mi }
+            limits:   { cpu: 1500m, memory: 2Gi }
           volumeMounts:
             - name: jetstream
               mountPath: /var/lib/nats/jetstream
+            - name: tls
+              mountPath: /etc/tls
+              readOnly: true
       volumes:
-        # No PVC on leaves — single-node clusters, hostPath survives node restarts
-        # but not node replacements. Acceptable for POC: KV state on leaves is
-        # JetStream mirror data, repopulates from R3 group when reattached.
         - name: jetstream
-          hostPath:
-            path: /var/lib/nats-kv/jetstream
-            type: DirectoryOrCreate
+          persistentVolumeClaim:
+            claimName: jetstream-data
+        - name: tls
+          secret:
+            secretName: nats-kv-tls
