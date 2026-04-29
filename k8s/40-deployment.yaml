@@ -52,19 +52,26 @@ spec:
               value: ":8080"
             - name: JETSTREAM_DIR
               value: "/var/lib/nats/jetstream"
+            # KV NATS uses +10 from defaults to avoid conflicting with the latency
+            # project's NATS mesh that already binds 4222/6222/8222 on every cluster.
             - name: NATS_CLIENT_PORT
-              value: "4222"
+              value: "4232"
             - name: NATS_CLUSTER_PORT
-              value: "6222"
+              value: "6232"
             - name: NATS_MONITOR_PORT
-              value: "8222"
+              value: "8232"
+            # Optional: NATS_ROUTES for cluster mesh, comma-separated nats-route:// URLs.
+            # LZ pod is the seed; leaves connect inbound. Add explicit routes here when
+            # we want LZ to actively dial leaves (post-bootstrap).
           ports:
             - name: http
               containerPort: 8080
             - name: nats-client
-              containerPort: 4222
+              containerPort: 4232
+            - name: nats-cluster
+              containerPort: 6232
             - name: nats-monitor
-              containerPort: 8222
+              containerPort: 8232
           readinessProbe:
             httpGet:
               path: /v1/health

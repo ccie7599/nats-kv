@@ -12,17 +12,19 @@ spec:
       port: 8080
       targetPort: 8080
     - name: nats-client
-      port: 4222
-      targetPort: 4222
+      port: 4232
+      targetPort: 4232
+    - name: nats-cluster
+      port: 6232
+      targetPort: 6232
     - name: nats-monitor
-      port: 8222
-      targetPort: 8222
+      port: 8232
+      targetPort: 8232
 ---
-# External LoadBalancer (NodeBalancer) for the v0.2 demo.
-# Per CLAUDE.md hostNetwork+hostPort is preferred for primary data plane;
-# we'll switch when we expand to multi-region (each leaf cluster is single-node, so
-# hostNetwork is the natural pattern then). For now NB is the fastest path to a
-# stable public endpoint with TLS in front (handled separately by Akamai property).
+# External LoadBalancer (NodeBalancer) for the LZ (us-ord) cluster.
+# Leaves use hostNetwork+hostPort directly (one node per leaf). This NB carries
+# both the HTTP API (port 80) and the NATS cluster mesh ingress (port 6232) so
+# leaves can dial back into us-ord as a seed.
 apiVersion: v1
 kind: Service
 metadata:
@@ -30,9 +32,6 @@ metadata:
   namespace: demo-nats-kv
   annotations:
     service.beta.kubernetes.io/linode-loadbalancer-throttle: "0"
-    # Firewall attached out-of-band (CCM rejects firewall_id annotation against
-    # account-scoped FWs in this LZ). Attach demo-nb-fw (3900446) post-create via
-    # `linode-cli firewalls device-create` once the NB exists.
 spec:
   type: LoadBalancer
   selector:
@@ -41,4 +40,8 @@ spec:
     - name: http
       port: 80
       targetPort: 8080
+      protocol: TCP
+    - name: nats-cluster
+      port: 6232
+      targetPort: 6232
       protocol: TCP
