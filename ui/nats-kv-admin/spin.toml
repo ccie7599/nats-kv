@@ -1,0 +1,20 @@
+#:schema https://schemas.spinframework.dev/spin/manifest-v2/latest.json
+
+spin_manifest_version = 2
+
+[application]
+name = "nats-kv-admin"
+version = "0.1.0"
+authors = ["ccie7599 <brian@apley.net>"]
+description = "NATS-KV admin UI"
+
+[[trigger.http]]
+route = "/..."
+component = "nats-kv-admin"
+
+[component.nats-kv-admin]
+source = "target/wasm32-wasip1/release/nats_kv_admin.wasm"
+allowed_outbound_hosts = ["https://cp.nats-kv.connected-cloud.io"]
+[component.nats-kv-admin.build]
+command = "cargo build --target wasm32-wasip1 --release"
+watch = ["src/**/*.rs", "Cargo.toml"]
