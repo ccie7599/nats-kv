@@ -54,6 +54,23 @@ func (s *Server) routes() {
 
 	// Claim flow — token in URL path, no admin auth.
 	s.mux.HandleFunc("/v1/claim/", s.claimHandler)
+
+	// Internal — adapters poll for active key list. Open to all (returns hashes,
+	// not plaintexts; nodes share an L7 firewall envelope).
+	s.mux.HandleFunc("/v1/internal/keys", s.internalKeysHandler)
+}
+
+func (s *Server) internalKeysHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	keys, err := s.store.AllKeys()
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"keys": keys})
 }
 
 // --- Admin auth middleware ---

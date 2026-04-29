@@ -182,6 +182,26 @@ func (s *Store) ListKeysByTenant(tenantID string) ([]*tenant.APIKey, error) {
 	return out, nil
 }
 
+// AllKeys returns every key record (active + revoked). Used by adapter pollers.
+func (s *Store) AllKeys() ([]*tenant.APIKey, error) {
+	keys, err := s.keys.Keys()
+	if errors.Is(err, nats.ErrNoKeysFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*tenant.APIKey, 0, len(keys))
+	for _, hash := range keys {
+		k, err := s.GetKeyByHash(hash)
+		if err != nil {
+			continue
+		}
+		out = append(out, k)
+	}
+	return out, nil
+}
+
 func (s *Store) RevokeKey(hash string) error {
 	k, err := s.GetKeyByHash(hash)
 	if err != nil {

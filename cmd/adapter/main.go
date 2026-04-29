@@ -88,10 +88,11 @@ func main() {
 	}
 
 	srv := adapter.New(adapter.Config{
-		Region:    region,
-		JS:        js,
-		NC:        nc,
-		DemoToken: demoToken,
+		Region:     region,
+		JS:         js,
+		NC:         nc,
+		DemoToken:  demoToken,
+		ControlURL: envOr("CONTROL_URL", "https://cp.nats-kv.connected-cloud.io"),
 	})
 
 	httpSrv := &http.Server{

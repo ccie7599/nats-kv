@@ -14,10 +14,11 @@ import (
 )
 
 type Config struct {
-	Region    string
-	JS        nats.JetStreamContext
-	NC        *nats.Conn
-	DemoToken string
+	Region     string
+	JS         nats.JetStreamContext
+	NC         *nats.Conn
+	DemoToken  string
+	ControlURL string
 }
 
 type Server struct {
@@ -32,7 +33,7 @@ func New(cfg Config) *Server {
 		cfg:     cfg,
 		mux:     http.NewServeMux(),
 		started: time.Now(),
-		keys:    NewKeyCache(cfg.JS, cfg.DemoToken),
+		keys:    NewKeyCache(cfg.JS, cfg.DemoToken, cfg.ControlURL),
 	}
 	s.routes()
 	return s
