@@ -37,7 +37,9 @@ async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
     // /api/nats/<path...>  — proxy to NATS adapter using caller's bearer key (or fallback)
     if let Some(rest) = path.strip_prefix("/api/nats/") {
         let key = caller_bearer(&req).unwrap_or_else(|| FALLBACK_TOKEN.to_string());
-        return Ok(call_nats(req.method().clone(), rest, req.body(), &key).await?);
+        let qs = req.query();
+        let path_with_qs = if qs.is_empty() { rest.to_string() } else { format!("{rest}?{qs}") };
+        return Ok(call_nats(req.method().clone(), &path_with_qs, req.body(), &key).await?);
     }
 
     // /api/cosmos/<bucket>/<key> — Spin's managed KV (Cosmos backend on FWF)
@@ -48,7 +50,9 @@ async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
     // /api/control/<path...> — proxy to control plane (caller's bearer forwarded)
     if let Some(rest) = path.strip_prefix("/api/control/") {
         let bearer = req.header("authorization").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        return Ok(call_control(req.method().clone(), rest, req.body(), &bearer).await?);
+        let qs = req.query();
+        let path_with_qs = if qs.is_empty() { rest.to_string() } else { format!("{rest}?{qs}") };
+        return Ok(call_control(req.method().clone(), &path_with_qs, req.body(), &bearer).await?);
     }
 
     Ok(Response::builder().status(404).body("not found").build())
