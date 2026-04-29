@@ -29,7 +29,7 @@ func NewStore(js nats.JetStreamContext, db *sql.DB) (*Store, error) {
 		Description: "tenant records, watched by adapters for live state",
 		History:     8,
 		Storage:     nats.FileStorage,
-		Replicas:    3,
+		Replicas:    1,  // R1 — JetStream proxies cross-cluster reads via leader; R3 fails on init due to cluster placement constraints with hostPath leaves
 	})
 	if err != nil {
 		return nil, fmt.Errorf("tenants bucket: %w", err)
@@ -39,7 +39,7 @@ func NewStore(js nats.JetStreamContext, db *sql.DB) (*Store, error) {
 		Description: "API key hash records, watched by adapters",
 		History:     8,
 		Storage:     nats.FileStorage,
-		Replicas:    3,
+		Replicas:    1,  // R1 — JetStream proxies cross-cluster reads via leader; R3 fails on init due to cluster placement constraints with hostPath leaves
 	})
 	if err != nil {
 		return nil, fmt.Errorf("keys bucket: %w", err)
