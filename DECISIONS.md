@@ -270,6 +270,54 @@ Property names match primary hostnames per global CLAUDE.md convention. Three Ak
 
 ---
 
+## ADR-024 — Three-token UI gate model (UI gate / KV bearer / admin bearer)
+**Status**: Accepted (2026-04-29)
+
+**Context**: Previously the user app was effectively open — anyone with the URL could browse `/play`, exercise the API explorer, and use the shared `demo` bucket via `akv_demo_open`. As we move toward sharing the demo with vetted Akamai engineers (and eventually external users), we want gating without forcing every visitor through a full claim flow.
+
+**Decision**: Three distinct tokens, each at a different layer:
+
+1. **UI gate token** — unlocks the *page* of the user app or admin app for browsing. Per-app: `ui_gate_token` for the demo, `admin_gate_token` for admin. Validated via either an `?access=<token>` query param (set on first hit) or a `nats-kv-ui-access` / `nats-kv-admin-gate` HttpOnly cookie thereafter. Whitelisted paths bypass: `/`, `/health`, `/api/request-invite`, `/claim/*` on user app; only `/health` on admin. The gate page renders at the top of the funnel; vetted users get a one-shot URL with `?access=` from the admin.
+2. **KV bearer** — once past the UI gate, the user still needs a KV bearer to actually do KV ops (existing `Authorization: Bearer akv_*`). The shared `akv_demo_open` works on the `demo` bucket; tenant-specific keys come from the claim flow.
+3. **Admin bearer** — vault-stored `admin_token` gates `/v1/admin/*` on the control plane. Brian-only.
+
+This separation matters because:
+- UI gate can be liberally shared with engineers who should browse the demo, without granting them the ability to mint tenants or revoke other people's keys.
+- KV bearer can be revoked per-tenant without affecting demo browsing.
+- Admin bearer rotates independently of either of the above.
+- A leaked UI gate is annoying (rotate it via `spin aka variables set ui_gate_token=<new>`) but doesn't compromise tenants or admin.
+
+**Implementation**: middleware in each Spin app's request handler, before route dispatch. Cookies are HttpOnly + Secure + SameSite=Lax + 14d. The `/claim/<token>` page on the user app sets the UI cookie when served, so an admin-shared `/claim/<token>?access=<gate>` URL works whether the recipient bookmarks the bare claim path or the full URL.
+
+**Token sharing pattern** (admin app's "approve invite" generates two URLs):
+- Akamai: `https://nats-kv.connected-cloud.io/claim/<inv>?access=<gate>` (works after Akamai property activates)
+- FWF direct: `https://3c5be533-...fwf.app/claim/<inv>?access=<gate>` (works today)
+
+**Why not OIDC / EAA / proper auth**: deliberate scope decision (per ADR non-goal) — this is a demo POC, not a production service. EAA would add ops weight and gate the demo behind Akamai SSO that external invitees won't have. Bearer/cookie tokens are the simplest layer that achieves "private but shareable" for the audience that matters.
+
+---
+
+## ADR-023 — Single Akamai property, two hostnames, per-host rules (over property-per-app)
+**Status**: Accepted (2026-04-29)
+
+**Context**: Bringing the demo and admin Spin apps behind Akamai (instead of using FWF-direct URLs) needed a property scheme. Two options:
+1. **Two properties** — `nats-kv.connected-cloud.io` (demo) and `nats-kv-admin.connected-cloud.io` (admin), each with its own rules tree, CP code, DS2 stream, and edge hostname.
+2. **One property, two hostnames** — single property holds both client hostnames; the rules tree branches on the Host header to send each hostname to a different Spin origin.
+
+I initially recommended (1), the user pushed back to try (2). On reflection (2) is correct for this demo:
+
+**Why one property won here**:
+- **Single CP code** = nats-kv shows up as ONE entry in the demo-usage Grafana dashboard's `demo` template variable, not split across two confusing entries.
+- **Single DS2 stream** = one ClickHouse delivery; reqHost field already distinguishes demo vs admin in queries.
+- **Single edge hostname + cert SAN entry** = less plumbing in CPS (we're out of cert entitlements anyway, so the SAN cert at enrollment 293468 was the only viable path; one edge hostname referencing it = two SANs added, not four).
+- **Same caching/perf policy** for both — admin pages and demo pages both want NO_STORE on dynamic paths, both benefit from the same SureRoute+H/2/3 stack, both have the same shape of static assets. Per-host rules give us the tiny customizations (admin = NO_STORE everywhere, demo = MAX_AGE 5m on UI assets) without duplicating the whole tree.
+
+**Implementation**: `data "akamai_property_rules_builder" "default_rule"` sets the demo origin and caching shape; child rule `admin_origin_override` matches `criterion { hostname { values = [admin_hostname] } }` and swaps origin + tightens cache to NO_STORE + downstream BUST. DS2 logs both hostnames to one stream, distinguished in ClickHouse by `reqHost` column.
+
+**When to revisit**: if admin needs distinctly different policy (mTLS, IP allowlist, EAA SSO) or a separate observability budget, split. For now the gate token (ADR-024) provides admin-side defense-in-depth without needing property-level separation.
+
+---
+
 ## ADR-020 — Adapter reads address the local mirror by stream name (NATS direct-get load-balances; we need explicit local pinning)
 **Status**: Accepted (2026-04-29)
 
