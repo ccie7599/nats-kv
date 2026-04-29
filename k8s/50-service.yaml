@@ -30,5 +30,6 @@ spec:
     app: kv-adapter
   ports:
     - { name: http,         port: 80,   targetPort: 8080, protocol: TCP }
+    - { name: http-alt,     port: 8080, targetPort: 8080, protocol: TCP }
     - { name: https,        port: 443,  targetPort: 8443, protocol: TCP }
     - { name: nats-cluster, port: 6222, targetPort: 6222, protocol: TCP }

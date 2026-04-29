@@ -2,7 +2,7 @@ use spin_sdk::http::{IntoResponse, Method, Request, Response};
 use spin_sdk::http_component;
 use spin_sdk::key_value::Store;
 
-const ADAPTER_BASE: &str = "https://edge.nats-kv.connected-cloud.io";
+const ADAPTER_BASE: &str = "http://edge.nats-kv.connected-cloud.io:8080";
 const CONTROL_BASE: &str = "https://cp.nats-kv.connected-cloud.io";
 const FALLBACK_TOKEN: &str = "akv_demo_open"; // used by playground if user not signed in
 
@@ -34,7 +34,29 @@ async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
             .build());
     }
 
-    // /api/probe-claudebot — call a plain-HTTP probe on a Chicago Linode (no TLS, no NB)
+    // /api/probe-ip — hit the us-ord NB by IP (no DNS lookup), plain HTTP. Diff vs
+    // /api/nats by hostname approximates DNS resolution cost on the FWF Spin path.
+    if path == "/api/probe-ip" {
+        let mut b = Request::builder();
+        b.method(Method::Get);
+        b.uri("http://172.237.141.164/v1/health");
+        b.body(Vec::<u8>::new());
+        let t0 = std::time::Instant::now();
+        let upstream: Response = spin_sdk::http::send(b.build()).await?;
+        let elapsed_us = t0.elapsed().as_micros();
+        let body_b64 = b64encode(upstream.body());
+        let payload = format!(
+            r#"{{"upstream_us":{elapsed_us},"status":{},"body_b64":"{body_b64}"}}"#,
+            *upstream.status() as u16,
+        );
+        return Ok(Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(payload)
+            .build());
+    }
+
+    // /api/probe-claudebot — legacy probe to a third-party Chicago Linode (kept for now)
     if path == "/api/probe-claudebot" {
         let mut b = Request::builder();
         b.method(Method::Get);
