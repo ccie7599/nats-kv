@@ -8,6 +8,12 @@ version = "0.1.0"
 authors = ["ccie7599 <brian@apley.net>"]
 description = "NATS-KV admin UI"
 
+# Admin gate token — separate from the user-app's `ui_gate_token` so admin
+# access is controlled and rotated independently. Set via:
+#   spin aka variables set admin_gate_token=<value>
+[variables]
+admin_gate_token = { default = "admin-gate-2026-rotateme" }
+
 [[trigger.http]]
 route = "/..."
 component = "nats-kv-admin"
@@ -15,6 +21,8 @@ component = "nats-kv-admin"
 [component.nats-kv-admin]
 source = "target/wasm32-wasip1/release/nats_kv_admin.wasm"
 allowed_outbound_hosts = ["https://cp.nats-kv.connected-cloud.io"]
+[component.nats-kv-admin.variables]
+admin_gate_token = "{{ admin_gate_token }}"
 [component.nats-kv-admin.build]
 command = "cargo build --target wasm32-wasip1 --release"
 watch = ["src/**/*.rs", "Cargo.toml"]

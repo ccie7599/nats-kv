@@ -119,7 +119,23 @@ async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
             .build());
     }
     if path.starts_with("/claim/") {
-        return html(CLAIM_HTML);
+        // Serving a claim URL implies a vetted recipient — set the UI gate
+        // cookie so the recipient can navigate past /play / /dash / /docs
+        // immediately after the claim flow completes, without also needing
+        // the ?access= query param. The admin app's invite share URLs append
+        // ?access=<gate> too as belt-and-suspenders, but this makes
+        // /claim/<token>-only links work just as well.
+        let token = ui_gate_token();
+        let cookie = format!("{UI_COOKIE}={token}; Path=/; Max-Age=1209600; HttpOnly; SameSite=Lax; Secure");
+        let body = CLAIM_HTML
+            .replace("__SHARED_CSS__", SHARED_CSS)
+            .replace("__NAV_JS__", NAV_JS);
+        return Ok(Response::builder()
+            .status(200)
+            .header("content-type", "text/html; charset=utf-8")
+            .header("set-cookie", cookie)
+            .body(body)
+            .build());
     }
     if path == "/health" {
         return Ok(Response::builder()
@@ -299,23 +315,11 @@ async fn call_nats(method: Method, path: &str, body: &[u8], token: &str) -> anyh
 }
 
 // Forward the visitor's invite request body to the control plane's open
-// /v1/internal/invite-requests endpoint. Body is whatever the page POSTed
-// (we trust the control plane to validate name/email shape).
+// /v1/internal/invite-requests endpoint. Reuses the same HTTPS path as
+// /api/control/* (proven working) so we don't re-introduce the TLS shape
+// quirks of a hand-rolled Request::builder.
 async fn forward_invite_request(req: &Request) -> anyhow::Result<Response> {
-    let body = req.body();
-    let url = format!("{CONTROL_BASE}/v1/internal/invite-requests");
-    let mut b = Request::builder();
-    b.method(Method::Post);
-    b.uri(url);
-    b.header("Content-Type", "application/json");
-    b.body(body.to_vec());
-    let upstream: Response = spin_sdk::http::send(b.build()).await?;
-    let status = *upstream.status() as u16;
-    Ok(Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(upstream.body().to_vec())
-        .build())
+    call_control(Method::Post, "v1/internal/invite-requests", req.body(), "").await
 }
 
 async fn call_cosmos(method: Method, path: &str, body: &[u8]) -> anyhow::Result<Response> {

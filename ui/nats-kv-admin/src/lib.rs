@@ -1,25 +1,76 @@
 use spin_sdk::http::{IntoResponse, Method, Request, Response};
 use spin_sdk::http_component;
+use spin_sdk::variables;
 
 const CONTROL_BASE: &str = "https://cp.nats-kv.connected-cloud.io";
+const ADMIN_GATE_COOKIE: &str = "nats-kv-admin-gate";
+
+fn admin_gate_token() -> String {
+    variables::get("admin_gate_token").unwrap_or_else(|_| "admin-gate-2026-rotateme".to_string())
+}
+
+// True if the request carries a valid admin-gate cookie OR a valid `?access=`
+// query. Whitelisted: /health only.
+fn is_admin_authed(req: &Request) -> bool {
+    let want = admin_gate_token();
+    if let Some(cookie_hdr) = req.header("cookie").and_then(|v| v.as_str()) {
+        for kv in cookie_hdr.split(';') {
+            let p = kv.trim();
+            if let Some(rest) = p.strip_prefix(&format!("{ADMIN_GATE_COOKIE}=")) {
+                if rest == want {
+                    return true;
+                }
+            }
+        }
+    }
+    let q = req.query();
+    for pair in q.split('&') {
+        if let Some(v) = pair.strip_prefix("access=") {
+            if v == want {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 #[http_component]
 async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
     let path = req.path();
-
-    if path == "/" || path == "/index.html" {
-        return Ok(Response::builder()
-            .status(200)
-            .header("content-type", "text/html; charset=utf-8")
-            .body(INDEX_HTML)
-            .build());
-    }
 
     if path == "/health" {
         return Ok(Response::builder()
             .status(200)
             .header("content-type", "application/json")
             .body(r#"{"ok":true,"app":"nats-kv-admin"}"#)
+            .build());
+    }
+
+    // Admin gate: every other path requires the cookie OR ?access=<token>.
+    if !is_admin_authed(&req) {
+        return Ok(Response::builder()
+            .status(403)
+            .header("content-type", "text/html; charset=utf-8")
+            .body(GATE_HTML)
+            .build());
+    }
+    // Capture ?access=<token> on first hit — set cookie and 302 to clean URL.
+    if req.query().contains("access=") {
+        let token = admin_gate_token();
+        let cookie = format!("{ADMIN_GATE_COOKIE}={token}; Path=/; Max-Age=1209600; HttpOnly; SameSite=Lax; Secure");
+        return Ok(Response::builder()
+            .status(302)
+            .header("location", path)
+            .header("set-cookie", cookie)
+            .body(Vec::<u8>::new())
+            .build());
+    }
+
+    if path == "/" || path == "/index.html" {
+        return Ok(Response::builder()
+            .status(200)
+            .header("content-type", "text/html; charset=utf-8")
+            .body(INDEX_HTML)
             .build());
     }
 
@@ -62,6 +113,29 @@ async fn proxy(method: Method, path: &str, body: &[u8], auth: &str) -> anyhow::R
     resp.header("Access-Control-Allow-Origin", "*");
     Ok(resp.body(upstream.body().to_vec()).build())
 }
+
+// Minimal gate page shown to anyone hitting the admin app without the right
+// query token or cookie. Distinct copy from the user app's gate page — there
+// is no "request access" path here; admin access is by direct token only.
+const GATE_HTML: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>NATS-KV admin</title>
+<style>
+  body { font-family: ui-monospace, monospace; background:#0d1117; color:#c9d1d9; max-width:540px; margin:60px auto; padding:24px; }
+  h1 { color:#f85149; margin-top:0; }
+  .box { padding:16px; border:1px solid #30363d; border-radius:6px; background:#161b22; }
+  input { width:100%; background:#0d1117; color:#c9d1d9; border:1px solid #30363d; border-radius:4px; padding:8px; font-family:inherit; font-size:13px; box-sizing:border-box; }
+  button { background:#f85149; color:#0d1117; border:0; padding:8px 14px; border-radius:4px; font-weight:600; font-family:inherit; cursor:pointer; margin-top:8px; }
+  .meta { color:#8b949e; font-size:12px; margin-top:16px; }
+</style></head><body>
+<h1>NATS-KV admin</h1>
+<div class="box">
+  <p>This admin console is gated. Paste the admin gate token below — separate from the admin <em>bearer</em> token (the bearer comes after).</p>
+  <input id="t" type="password" placeholder="admin gate token">
+  <button onclick="window.location='?access=' + encodeURIComponent(document.getElementById('t').value)">Unlock</button>
+</div>
+<p class="meta">If you're not Brian, you're in the wrong place.</p>
+</body></html>
+"##;
 
 const INDEX_HTML: &str = r##"<!doctype html>
 <html lang="en">
