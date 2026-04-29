@@ -481,14 +481,17 @@ const DASH_HTML: &str = r##"<!doctype html>
   <legend>Create a bucket</legend>
   <div class="row">
     <div><label>name (will be prefixed with tenant ID)</label><input id="b-name" placeholder="sessions"></div>
-    <div><label>replicas</label><select id="b-replicas"><option value="1">R1 (single replica, max throughput)</option><option value="3" selected>R3 (RAFT, durable)</option><option value="5">R5 (RAFT, geo-spread)</option></select></div>
-    <div><label>geo (RAFT placement)</label><select id="b-geo"><option value="auto">auto (any)</option><option value="na">NA</option><option value="eu">EU</option><option value="ap">AP</option><option value="sa">SA</option></select></div>
+    <div><label>replicas</label><select id="b-replicas" onchange="refreshPlacementPreview()"><option value="1">R1 (single replica, max throughput)</option><option value="3" selected>R3 (RAFT, durable)</option><option value="5">R5 (RAFT, geo-spread)</option></select></div>
+    <div><label>geo (RAFT placement)</label><select id="b-geo" onchange="onGeoChange()"><option value="auto" selected>auto (latency-driven)</option><option value="na">NA</option><option value="eu">EU</option><option value="ap">AP</option><option value="sa">SA</option></select></div>
+    <div id="b-anchor-row"><label>anchor region (for auto)</label><select id="b-anchor" onchange="refreshPlacementPreview()"></select></div>
   </div>
+  <div id="placement-preview" class="meta" style="margin-top:8px; padding:8px; border:1px solid #30363d; border-radius:4px; background:#0d1117; display:none"></div>
   <div class="actions">
-    <label style="display:flex; align-items:center; gap:6px; margin:0;"><input type="checkbox" id="b-mirrors" checked style="width:auto"> auto-create mirrors in other geos for local reads</label>
+    <label style="display:flex; align-items:center; gap:6px; margin:0;"><input type="checkbox" id="b-mirrors" checked style="width:auto"> auto-create mirrors in other regions for local reads</label>
     <button onclick="createBucket()">Create</button>
   </div>
   <div id="create-out" class="meta" style="margin-top:6px"></div>
+  <div id="create-decision" style="margin-top:6px; display:none"></div>
 </fieldset>
 
 <fieldset id="buckets" style="display:none">
@@ -508,6 +511,8 @@ if (!userKey()) {
   document.getElementById("info").style.display = "block";
   document.getElementById("create-bucket").style.display = "block";
   document.getElementById("buckets").style.display = "block";
+  populateAnchors();
+  onGeoChange();         // render initial preview (default geo=auto, anchor=us-ord, R3)
   loadMe();
   loadBuckets();
 }
@@ -517,14 +522,98 @@ async function loadMe() {
   document.getElementById("t-id").textContent = j.tenant_id || "(unknown)";
   document.getElementById("t-tag").textContent = j.tag || "(no tag)";
 }
+// Regions list — kept in sync with internal/placement/geo.go AllRegions.
+const ALL_REGIONS = [
+  "us-ord","us-east","us-central","us-west","us-southeast","us-lax","us-mia","us-sea","ca-central","br-gru",
+  "gb-lon","eu-central","de-fra-2","fr-par-2","nl-ams","se-sto","it-mil",
+  "ap-south","sg-sin-2","ap-northeast","jp-tyo-3","jp-osa","ap-west","in-bom-2","in-maa","id-cgk","ap-southeast",
+];
+
+function populateAnchors() {
+  const sel = document.getElementById("b-anchor");
+  sel.innerHTML = "";
+  for (const r of ALL_REGIONS) {
+    const opt = document.createElement("option");
+    opt.value = r; opt.textContent = r;
+    sel.appendChild(opt);
+  }
+  // Default to whatever /api/whereami says about the FWF egress region.
+  fetch("/api/whereami").then(r=>r.json()).then(w=>{
+    try {
+      const ip = JSON.parse(atob(w.body_b64||"")).region || "";
+      // fall through; we don't have a mapping from generic geo to NATS region,
+      // so just leave default us-ord and let the user pick.
+    } catch (e) {}
+  }).catch(()=>{});
+  sel.value = "us-ord";
+}
+
+function onGeoChange() {
+  const geo = document.getElementById("b-geo").value;
+  document.getElementById("b-anchor-row").style.display = geo === "auto" ? "" : "none";
+  refreshPlacementPreview();
+}
+
+let _previewSeq = 0;
+async function refreshPlacementPreview() {
+  const geo = document.getElementById("b-geo").value;
+  const previewEl = document.getElementById("placement-preview");
+  if (geo !== "auto") {
+    previewEl.style.display = "none";
+    return;
+  }
+  const replicas = parseInt(document.getElementById("b-replicas").value, 10);
+  const anchor = document.getElementById("b-anchor").value;
+  const seq = ++_previewSeq;
+  previewEl.style.display = "block";
+  previewEl.innerHTML = `<span class="meta">computing placement for anchor=${anchor} R${replicas}…</span>`;
+  try {
+    const r = await fetch(`/api/control/v1/placement/preview?anchor=${encodeURIComponent(anchor)}&replicas=${replicas}`);
+    if (seq !== _previewSeq) return; // newer preview already in flight
+    if (!r.ok) {
+      const j = await r.json().catch(()=>({error:`HTTP ${r.status}`}));
+      previewEl.innerHTML = `<span class="err">${j.error||r.status}</span>`;
+      return;
+    }
+    const d = await r.json();
+    previewEl.innerHTML = renderPlacement(d);
+  } catch (e) {
+    if (seq !== _previewSeq) return;
+    previewEl.innerHTML = `<span class="err">preview failed: ${e.message}</span>`;
+  }
+}
+
+function renderPlacement(d) {
+  const cands = (d.candidates||[]).map(c => {
+    const winner = c.geo === d.chosen_geo;
+    const cls = winner ? "ok" : (c.eligible ? "" : "meta");
+    const score = c.eligible ? `${c.write_latency_ms.toFixed(1)}ms` : "—";
+    const regions = (c.regions||[]).join(", ") || "—";
+    return `<tr style="${winner?'font-weight:600':''}"><td style="padding:2px 8px"><span class="${cls}">${c.geo}</span>${winner?' ★':''}</td><td style="padding:2px 8px">${score}</td><td style="padding:2px 8px">${c.eligible?c.quorum_edge_ms.toFixed(1)+'ms':'—'}</td><td style="padding:2px 8px;font-size:11px">${regions}</td><td style="padding:2px 8px;font-size:11px;color:#8b949e">${c.reason||''}</td></tr>`;
+  }).join("");
+  const sampled = d.matrix_sampled_at ? new Date(d.matrix_sampled_at).toLocaleTimeString() : "—";
+  return `
+    <div style="margin-bottom:6px"><b>Auto-placement preview</b> · anchor <code>${d.anchor}</code> · R${d.replicas} · matrix sampled ${sampled}</div>
+    <div style="margin-bottom:6px">Winner: <span class="ok"><b>${d.chosen_geo}</b></span> · expected write ${d.write_latency_ms.toFixed(1)}ms · quorum edge ${d.quorum_edge_ms.toFixed(1)}ms · regions <code>${(d.chosen_regions||[]).join(", ")}</code></div>
+    <table style="width:100%; border-collapse:collapse; font-size:12px">
+      <thead><tr style="border-bottom:1px solid #30363d"><th style="text-align:left;padding:2px 8px">geo</th><th style="text-align:left;padding:2px 8px">write</th><th style="text-align:left;padding:2px 8px">quorum edge</th><th style="text-align:left;padding:2px 8px">regions</th><th style="text-align:left;padding:2px 8px">reason</th></tr></thead>
+      <tbody>${cands}</tbody>
+    </table>
+    ${(d.notes||[]).length?`<div class="meta" style="margin-top:4px">${(d.notes||[]).map(n=>'• '+n).join('<br>')}</div>`:''}
+  `;
+}
+
 async function createBucket() {
   const body = {
     name: document.getElementById("b-name").value.trim(),
     replicas: parseInt(document.getElementById("b-replicas").value, 10),
     geo: document.getElementById("b-geo").value,
-    want_mirrors: document.getElementById("b-mirrors").checked,
+    no_mirrors: !document.getElementById("b-mirrors").checked,
     history: 8,
   };
+  if (body.geo === "auto") {
+    body.anchor = document.getElementById("b-anchor").value;
+  }
   if (!body.name) { alert("name required"); return; }
   const r = await authedFetch("/api/control/v1/me/buckets", {
     method: "POST",
@@ -534,6 +623,15 @@ async function createBucket() {
   const j = await r.json();
   if (!r.ok) { document.getElementById("create-out").innerHTML = `<span class="err">${j.error||r.status}</span>`; return; }
   document.getElementById("create-out").innerHTML = `<span class="ok">created ${j.bucket}</span> · ${(j.mirrors||[]).length} mirrors`;
+  // Render the placement decision the server actually applied (matches preview
+  // when the user accepted defaults; differs if they manually picked a geo).
+  const decEl = document.getElementById("create-decision");
+  if (j.placement) {
+    decEl.style.display = "block";
+    decEl.innerHTML = `<div style="padding:8px; border:1px solid #30363d; border-radius:4px; background:#0d1117">${renderPlacement(j.placement)}</div>`;
+  } else {
+    decEl.style.display = "none";
+  }
   document.getElementById("b-name").value = "";
   loadBuckets();
 }
