@@ -40,13 +40,13 @@ func main() {
 		StoreDir:   storeDir,
 		Tags:       []string{"region:" + region},
 		NoSigs:     true,
-	}
-	if natsRoutes != "" {
-		opts.Cluster = natsserver.ClusterOpts{
+		Cluster: natsserver.ClusterOpts{
 			Name: "nats-kv-mesh",
 			Host: "0.0.0.0",
 			Port: clusterPort,
-		}
+		},
+	}
+	if natsRoutes != "" {
 		opts.Routes = natsserver.RoutesFromStr(natsRoutes)
 	}
 

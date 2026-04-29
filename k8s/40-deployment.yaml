@@ -38,7 +38,7 @@ spec:
       # Read DEMO_TOKEN from Vault-injected file at startup
       containers:
         - name: adapter
-          image: harbor.harbor.svc.cluster.local/presales/nats-kv-adapter:v0.1.0
+          image: harbor.harbor.svc.cluster.local/presales/nats-kv-adapter:v0.1.1
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -60,9 +60,11 @@ spec:
               value: "6232"
             - name: NATS_MONITOR_PORT
               value: "8232"
-            # Optional: NATS_ROUTES for cluster mesh, comma-separated nats-route:// URLs.
-            # LZ pod is the seed; leaves connect inbound. Add explicit routes here when
-            # we want LZ to actively dial leaves (post-bootstrap).
+            # NATS cluster mesh seed. LZ self-routes (NATS dedups self) to satisfy
+            # JetStream's requirement of being part of a cluster on boot. Leaves
+            # gossip-discover other peers via this seed.
+            - name: NATS_ROUTES
+              value: "nats-route://us-ord.nats-kv.connected-cloud.io:6232"
           ports:
             - name: http
               containerPort: 8080
