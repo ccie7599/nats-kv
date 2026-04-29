@@ -122,20 +122,63 @@ func (s *Server) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	out := []map[string]any{}
 	for name := range s.cfg.JS.KeyValueStoreNames() {
-		kv, err := s.cfg.JS.KeyValue(name)
-		if err != nil {
-			continue
-		}
-		st, _ := kv.Status()
-		entry := map[string]any{"name": name}
-		if st != nil {
-			entry["values"] = st.Values()
-			entry["history"] = st.History()
-			entry["bytes"] = st.Bytes()
-		}
-		out = append(out, entry)
+		out = append(out, s.bucketSummary(name))
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"buckets": out})
+	_ = json.NewEncoder(w).Encode(map[string]any{"buckets": out, "served_by": s.cfg.Region})
+}
+
+// bucketSummary enriches a bucket with replica/leader/lag for topology UI.
+func (s *Server) bucketSummary(name string) map[string]any {
+	entry := map[string]any{"name": name}
+	kv, err := s.cfg.JS.KeyValue(name)
+	if err != nil {
+		entry["error"] = err.Error()
+		return entry
+	}
+	st, _ := kv.Status()
+	if st != nil {
+		entry["values"] = st.Values()
+		entry["history"] = st.History()
+		entry["bytes"] = st.Bytes()
+	}
+	// Stream backing the KV bucket has name "KV_<bucket>"
+	if info, err := s.cfg.JS.StreamInfo("KV_" + name); err == nil && info != nil {
+		entry["replicas"] = info.Config.Replicas
+		entry["mirror"] = info.Config.Mirror
+		entry["sources"] = info.Config.Sources
+		entry["placement_tags"] = nil
+		if info.Config.Placement != nil {
+			entry["placement_tags"] = info.Config.Placement.Tags
+			entry["placement_cluster"] = info.Config.Placement.Cluster
+		}
+		if info.Cluster != nil {
+			peers := []map[string]any{}
+			peers = append(peers, map[string]any{
+				"name":    info.Cluster.Leader,
+				"role":    "leader",
+				"current": true,
+				"lag_ms":  0,
+			})
+			for _, p := range info.Cluster.Replicas {
+				peers = append(peers, map[string]any{
+					"name":    p.Name,
+					"role":    "replica",
+					"current": p.Current,
+					"active":  p.Active.Milliseconds(),
+					"lag_ms":  p.Lag,
+				})
+			}
+			entry["peers"] = peers
+			entry["cluster"] = info.Cluster.Name
+		}
+		entry["state"] = map[string]any{
+			"messages": info.State.Msgs,
+			"bytes":    info.State.Bytes,
+			"first_ts": info.State.FirstTime,
+			"last_ts":  info.State.LastTime,
+		}
+	}
+	return entry
 }
 
 func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {

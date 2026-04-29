@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -41,7 +42,7 @@ func main() {
 		HTTPPort:   monitorPort,
 		JetStream:  true,
 		StoreDir:   storeDir,
-		Tags:       []string{"region:" + region},
+		Tags:       []string{"region:" + region, "geo:" + geoOfRegion(region)},
 		NoSigs:     true,
 		Cluster: natsserver.ClusterOpts{
 			Name:      "nats-kv-mesh",
@@ -151,4 +152,28 @@ func envInt(k string, d int) int {
 		}
 	}
 	return d
+}
+
+// geoOfRegion mirrors internal/adapter/server.go geoOf — kept here to avoid
+// importing internal package from main. Six geos: na, eu, ap, sa, oc, af.
+func geoOfRegion(region string) string {
+	switch {
+	case strings.HasPrefix(region, "us-"), strings.HasPrefix(region, "ca-"):
+		return "na"
+	case strings.HasPrefix(region, "eu-"), strings.HasPrefix(region, "de-"), strings.HasPrefix(region, "fr-"),
+		strings.HasPrefix(region, "gb-"), strings.HasPrefix(region, "it-"), strings.HasPrefix(region, "nl-"),
+		strings.HasPrefix(region, "se-"), strings.HasPrefix(region, "es-"), strings.HasPrefix(region, "no-"):
+		return "eu"
+	case strings.HasPrefix(region, "ap-"), strings.HasPrefix(region, "jp-"), strings.HasPrefix(region, "id-"),
+		strings.HasPrefix(region, "in-"), strings.HasPrefix(region, "sg-"), strings.HasPrefix(region, "my-"):
+		return "ap"
+	case strings.HasPrefix(region, "br-"), strings.HasPrefix(region, "co-"), strings.HasPrefix(region, "cl-"):
+		return "sa"
+	case strings.HasPrefix(region, "au-"), strings.HasPrefix(region, "nz-"):
+		return "oc"
+	case strings.HasPrefix(region, "za-"):
+		return "af"
+	default:
+		return "unknown"
+	}
 }
