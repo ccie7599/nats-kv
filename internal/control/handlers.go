@@ -176,6 +176,12 @@ func (s *Server) userBucketsHandler(w http.ResponseWriter, r *http.Request, t *t
 		// this single round trip — earlier two-call design (names from here +
 		// admin/buckets via adapter) failed when the adapter response (~50KB
 		// across all buckets) tripped Spin's body framing through FWF.
+		// Snapshot all stream names ONCE so bucketDetails doesn't re-enumerate
+		// the cluster catalog per bucket — same shape as adapter handleListBuckets.
+		allStreams := []string{}
+		for sn := range s.js.StreamNames() {
+			allStreams = append(allStreams, sn)
+		}
 		prefix := t.ID + "__"
 		names := []string{}
 		details := []map[string]any{}
@@ -184,7 +190,7 @@ func (s *Server) userBucketsHandler(w http.ResponseWriter, r *http.Request, t *t
 				continue
 			}
 			names = append(names, name)
-			details = append(details, s.bucketDetails(name))
+			details = append(details, s.bucketDetails(name, allStreams))
 		}
 		writeJSON(w, 200, map[string]any{"buckets": names, "details": details, "tenant_id": t.ID})
 	case http.MethodPost:
@@ -520,7 +526,7 @@ func (s *Server) resolvePlacement(ctx context.Context, req *createBucketReq) (*p
 // leader, placement tags, mirror count). Lifted from the adapter's
 // bucketSummary but kept lean — we don't need state size or per-mirror lag
 // here; the topology page covers that.
-func (s *Server) bucketDetails(name string) map[string]any {
+func (s *Server) bucketDetails(name string, allStreams []string) map[string]any {
 	out := map[string]any{"name": name}
 	streamName := "KV_" + name
 	si, err := s.js.StreamInfo(streamName)
@@ -546,8 +552,9 @@ func (s *Server) bucketDetails(name string) map[string]any {
 		out["leader"] = si.Cluster.Leader
 	}
 	mirrorCount := 0
-	for sn := range s.js.StreamNames() {
-		if strings.HasPrefix(sn, streamName+"_mirror_") {
+	mirrorPrefix := streamName + "_mirror_"
+	for _, sn := range allStreams {
+		if strings.HasPrefix(sn, mirrorPrefix) {
 			mirrorCount++
 		}
 	}

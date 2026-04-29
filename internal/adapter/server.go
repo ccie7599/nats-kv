@@ -179,17 +179,25 @@ func (s *Server) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	// Snapshot all stream names ONCE so each bucketSummary doesn't re-enumerate
+	// the cluster (was the second-biggest contributor to slow topology refresh).
+	allStreams := []string{}
+	for sn := range s.cfg.JS.StreamNames() {
+		allStreams = append(allStreams, sn)
+	}
 	out := []map[string]any{}
 	for name := range s.cfg.JS.KeyValueStoreNames() {
-		out = append(out, s.bucketSummary(name))
+		out = append(out, s.bucketSummary(name, allStreams))
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"buckets": out, "served_by": s.cfg.Region})
 }
 
 // bucketSummary enriches a bucket with replica/leader/lag for topology UI.
 // Also discovers any mirror streams (KV_<bucket>_mirror_*) and reports their
-// placement + lag so the UI can render the full consistency-domain shape.
-func (s *Server) bucketSummary(name string) map[string]any {
+// placement so the UI can render the full consistency-domain shape.
+// allStreams is the pre-fetched list of stream names so we don't re-enumerate
+// the cluster's stream catalog once per bucket.
+func (s *Server) bucketSummary(name string, allStreams []string) map[string]any {
 	entry := map[string]any{"name": name}
 	kv, err := s.cfg.JS.KeyValue(name)
 	if err != nil {
@@ -204,32 +212,25 @@ func (s *Server) bucketSummary(name string) map[string]any {
 	}
 	streamName := "KV_" + name
 
-	// Find mirror streams pointing at this bucket.
+	// Find mirror streams pointing at this bucket. We synthesize the per-mirror
+	// fields directly from the stream name (`KV_<bucket>_mirror_<region>`) —
+	// leader = `kv-<region>`, placement_tag = `region:<region>`. This avoids
+	// one StreamInfo() round-trip per mirror, which was 27 cross-region calls
+	// per bucket (5 buckets × 27 = ~140 sequential calls = ~24s topology
+	// refresh). The UI doesn't show per-mirror lag/active anymore so the
+	// missing State/Mirror/Cluster details aren't needed.
 	mirrors := []map[string]any{}
-	for sn := range s.cfg.JS.StreamNames() {
-		if !strings.HasPrefix(sn, streamName+"_mirror_") {
+	prefix := streamName + "_mirror_"
+	for _, sn := range allStreams {
+		if !strings.HasPrefix(sn, prefix) {
 			continue
 		}
-		mi, err := s.cfg.JS.StreamInfo(sn)
-		if err != nil || mi == nil {
-			continue
-		}
-		m := map[string]any{
-			"stream": sn,
-			"messages": mi.State.Msgs,
-		}
-		if mi.Mirror != nil {
-			m["lag_msgs"] = mi.Mirror.Lag
-			m["active_ms"] = mi.Mirror.Active.Milliseconds()
-		}
-		if mi.Config.Placement != nil {
-			m["placement_tags"] = mi.Config.Placement.Tags
-		}
-		if mi.Cluster != nil {
-			m["leader"] = mi.Cluster.Leader
-			m["cluster"] = mi.Cluster.Name
-		}
-		mirrors = append(mirrors, m)
+		region := strings.TrimPrefix(sn, prefix)
+		mirrors = append(mirrors, map[string]any{
+			"stream":         sn,
+			"leader":         "kv-" + region,
+			"placement_tags": []string{"region:" + region},
+		})
 	}
 	if len(mirrors) > 0 {
 		entry["mirrors"] = mirrors
