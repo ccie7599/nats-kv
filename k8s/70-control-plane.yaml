@@ -57,7 +57,10 @@ spec:
             - { name: PUBLIC_BASE_URL, value: "https://3c5be533-8e6d-423b-9962-87d9da8d16cd.fwf.app" }
             # Placement engine — pulls live RTT matrix from project-latency hub.
             # TODO: move LATENCY_AUTH_TOKEN to Vault (api/data/nats-kv/control) before any production posture.
-            - { name: LATENCY_HUB_URL, value: "https://latency.connected-cloud.io" }
+            # latency-demo (Akamai-fronted) is reachable from inside LZ; the
+            # direct-to-origin latency.connected-cloud.io has firewall rules
+            # that block our LZ NAT egress IP.
+            - { name: LATENCY_HUB_URL, value: "https://latency-demo.connected-cloud.io" }
             - { name: LATENCY_AUTH_TOKEN, value: "f77702e5b9277f608abd30707239e1f9" }
           ports:
             - { name: http,  containerPort: 8088 }
