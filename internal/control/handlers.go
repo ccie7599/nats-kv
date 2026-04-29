@@ -114,7 +114,7 @@ func (s *Server) userBucketsHandler(w http.ResponseWriter, r *http.Request, t *t
 	case http.MethodGet:
 		// List buckets owned by this tenant.
 		out := []string{}
-		prefix := t.ID + "."
+		prefix := t.ID + "__"
 		for name := range s.js.KeyValueStoreNames() {
 			if strings.HasPrefix(name, prefix) {
 				out = append(out, name)
@@ -152,7 +152,7 @@ func (s *Server) createUserBucket(w http.ResponseWriter, r *http.Request, t *ten
 		req.Geo = "auto"
 	}
 
-	bucketName := t.ID + "." + req.Name
+	bucketName := t.ID + "__" + req.Name
 	cfg := &nats.KeyValueConfig{
 		Bucket:      bucketName,
 		History:     req.History,
