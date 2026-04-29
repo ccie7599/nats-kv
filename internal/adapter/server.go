@@ -96,9 +96,13 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status": "ok",
-		"region": s.cfg.Region,
-		"uptime": time.Since(s.started).String(),
+		"status":      "ok",
+		"region":      s.cfg.Region,
+		"uptime":      time.Since(s.started).String(),
+		"caller_ip":   r.RemoteAddr,
+		"x_forwarded": r.Header.Get("X-Forwarded-For"),
+		"x_real_ip":   r.Header.Get("X-Real-IP"),
+		"user_agent":  r.Header.Get("User-Agent"),
 	})
 }
 
