@@ -210,6 +210,30 @@ Property names match primary hostnames per global CLAUDE.md convention. Three Ak
 
 ---
 
+## ADR-022 — Admin buckets are R5 in NA (post-mortem: R1 admin storage caused total data loss)
+**Status**: Accepted (2026-04-29)
+
+**Incident**: At 2026-04-29 14:19:27, the JetStream meta-RAFT propagated a 0-byte snapshot ("no streams exist") cluster-wide. All 27 peers truncated their local stream catalogs in response. PVs stayed attached but on-disk stream blocks were wiped — `du -sk /var/lib/nats/jetstream` went from "had data" to 80K (just `$SYS/_js_/` skeleton) on every peer. Lost: every user bucket (`demo-r3-na`, `demo-r3-eu`, `demo-r3-ap`, `demo-r5-global`, `demo-r1-us-ord`, all auto-created mirrors), the tenants/keys catalogs (`kv-admin-tenants-v2`, `kv-admin-keys-v2`), and the entire demo dataset.
+
+**Root cause**: the v2 admin buckets were created `Replicas: 1` with a comment saying "the cluster mesh proxies reads/watches from any other peer." That comment was wrong about what R1 means in JetStream — R1 is a single canonical replica, not a logically-shared singleton with cluster-wide proxy. JetStream pinned both buckets to the LZ adapter pod (the control plane's local NATS connection lands there). Earlier in the day Argo rolled the LZ adapter pod from v0.1.9 → v0.2.1; the new pod's PV came up with the JetStream skeleton (`$SYS/_js_/`) but no `_meta_/msgs/` log. With the LZ peer reporting "I don't have these streams" while leaves still had mirror data, the meta-RAFT eventually elected a leader that only had the empty view, snapshotted that view, and propagated it. Because the source streams were R1 with no replicas elsewhere, there was nothing to vote against the empty snapshot.
+
+**Why all 27 peers wiped, not just the LZ**: meta-RAFT snapshots are authoritative. Once "0 streams" became the consensus view, mirror streams (which depend on a source stream definition) were also reaped. Leaves had data on disk but NATS deleted those directories on snapshot apply.
+
+**Fix**:
+- `kv-admin-tenants-v3` and `kv-admin-keys-v3`: R5 with `placement.tags = [geo:na]`. 5 NA replicas (LZ + 4 leaves), quorum=3, survives 2 simultaneous peer failures. NA-only because the control plane's NATS connection lands in us-ord; cross-region quorum writes would slow tenant claim flows.
+- New version suffix (v3) instead of in-place R1→R5 update because in-place stream config changes for replica count require a careful migration path (peer-add followed by peer-remove) that isn't worth implementing for a POC. The wipe means there's no data to migrate anyway.
+- The `R1 keeps the bucket on one peer; cluster mesh proxies reads/watches` comment is removed because it described a behavior NATS doesn't have.
+
+**Bigger lesson**: R1 is appropriate only for buckets where the data is regenerable from elsewhere, OR where the cost of loss is acceptable. Admin / control-plane data is neither. Going forward, anything that gates user functionality (tenants, keys, audit, billing-relevant counters) is R3 minimum, R5 if it lives in one geo. The placement engine already rejects R1 as a non-default option for user buckets — same posture for internal storage.
+
+**Not addressed by this ADR (follow-ups)**:
+- The LZ adapter's PV came up with an inconsistent JetStream skeleton after rollout. Need to investigate whether the adapter's startup logic should refuse to start with a half-populated `_js_` dir, OR whether the deployment should clear the PV on rollout (since R5 means we don't need single-peer durability anymore).
+- Cluster-wide backup/restore: currently nothing snapshots PVs. For a tier-2 demo POC, accepting "rebuild on disaster" is fine, but should be called out.
+
+**Versions**: control `v0.1.12`. Rolled via Argo 2026-04-29.
+
+---
+
 ## ADR-021 — Placement engine recommends a geo, not arbitrary regions (NATS placement tags are AND-only)
 **Status**: Accepted (2026-04-29)
 

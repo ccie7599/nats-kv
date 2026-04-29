@@ -24,22 +24,31 @@ type Store struct {
 }
 
 func NewStore(js nats.JetStreamContext, db *sql.DB) (*Store, error) {
+	// Admin buckets are R5 with geo:na placement. R1 was the v2 design — it
+	// pinned both buckets to a single peer (the LZ pod), so when that pod's
+	// PV came up empty after an Argo rollout on 2026-04-29, the meta-RAFT
+	// snapshot reset propagated "no streams" cluster-wide and wiped every
+	// tenant + key + every user bucket. R5 in NA gives 2-failure survivability
+	// and keeps writes fast for the LZ-resident control plane. v3 names because
+	// in-place R1→R5 upgrade isn't worth the migration complexity.
 	tb, err := openOrCreate(js, &nats.KeyValueConfig{
-		Bucket:      "kv-admin-tenants-v2",
+		Bucket:      "kv-admin-tenants-v3",
 		Description: "tenant records, watched by adapters for live state",
 		History:     8,
 		Storage:     nats.FileStorage,
-		Replicas:    1,  // R1 keeps the bucket on one peer; cluster mesh proxies reads/watches from any other peer. R3+ requires explicit JetStream placement tags — revisit.
+		Replicas:    5,
+		Placement:   &nats.Placement{Tags: []string{"geo:na"}},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("tenants bucket: %w", err)
 	}
 	kb, err := openOrCreate(js, &nats.KeyValueConfig{
-		Bucket:      "kv-admin-keys-v2",
+		Bucket:      "kv-admin-keys-v3",
 		Description: "API key hash records, watched by adapters",
 		History:     8,
 		Storage:     nats.FileStorage,
-		Replicas:    1,  // R1 keeps the bucket on one peer; cluster mesh proxies reads/watches from any other peer. R3+ requires explicit JetStream placement tags — revisit.
+		Replicas:    5,
+		Placement:   &nats.Placement{Tags: []string{"geo:na"}},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("keys bucket: %w", err)
