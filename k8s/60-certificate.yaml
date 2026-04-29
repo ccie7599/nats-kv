@@ -12,9 +12,8 @@ spec:
   issuerRef:
     name: letsencrypt-prod
     kind: ClusterIssuer
-  commonName: nats-kv.connected-cloud.io
+  commonName: "*.nats-kv.connected-cloud.io"
   dnsNames:
-    - "nats-kv.connected-cloud.io"
     - "*.nats-kv.connected-cloud.io"
   duration: 2160h     # 90 days
   renewBefore: 720h   # 30 days
