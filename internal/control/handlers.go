@@ -20,12 +20,13 @@ type Server struct {
 	mux        *http.ServeMux
 	adminToken string // bearer required on /v1/admin/*
 	pubBaseURL string // for building claim URLs
+	nc         *nats.Conn        // raw NATS connection — used for stream-leader-stepdown API requests
 	js         nats.JetStreamContext
 	placer     *placement.Engine // nil disables auto-placement (falls back to NATS default)
 }
 
-func New(store *Store, adminToken, pubBaseURL string, js nats.JetStreamContext, placer *placement.Engine) *Server {
-	s := &Server{store: store, mux: http.NewServeMux(), adminToken: adminToken, pubBaseURL: strings.TrimRight(pubBaseURL, "/"), js: js, placer: placer}
+func New(store *Store, adminToken, pubBaseURL string, nc *nats.Conn, js nats.JetStreamContext, placer *placement.Engine) *Server {
+	s := &Server{store: store, mux: http.NewServeMux(), adminToken: adminToken, pubBaseURL: strings.TrimRight(pubBaseURL, "/"), nc: nc, js: js, placer: placer}
 	s.routes()
 	return s
 }
@@ -293,9 +294,26 @@ func (s *Server) materializeBucket(bucketName string, replicas int, history uint
 			patched.AllowDirect = true
 			_, _ = s.js.UpdateStream(&patched)
 		}
+		// Force the leader to the engine's preferred region (chosen_regions[0])
+		// so writes from that region's adapter don't pay a cross-cluster hop.
+		// JetStream's placement.tags = [geo:<g>] picks any peer in the geo for
+		// leadership, often a far-away one. We use the JS stream-leader-stepdown
+		// API with a region tag to force election toward the top-ranked region.
+		if decision != nil && len(decision.ChosenRegions) > 0 && si.Cluster != nil {
+			preferred := decision.ChosenRegions[0]
+			if !strings.HasSuffix(si.Cluster.Leader, preferred) {
+				_, _ = s.nc.Request(
+					"$JS.API.STREAM.LEADER.STEPDOWN."+srcStream,
+					[]byte(`{"placement":{"tags":["region:`+preferred+`"]}}`),
+					3*time.Second,
+				)
+				time.Sleep(500 * time.Millisecond) // let election settle before reading actual
+				si, _ = s.js.StreamInfo(srcStream)
+			}
+		}
 		// Record the actual placement so the UI can show what NATS chose vs
 		// what the engine predicted (placement.tags=[geo:<g>] is coarse).
-		if decision != nil && si.Cluster != nil {
+		if decision != nil && si != nil && si.Cluster != nil {
 			actual := []string{}
 			if si.Cluster.Leader != "" {
 				actual = append(actual, strings.TrimPrefix(si.Cluster.Leader, "kv-"))

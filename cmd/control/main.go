@@ -71,7 +71,7 @@ func main() {
 		log.Print("placement engine: disabled (LATENCY_HUB_URL empty)")
 	}
 
-	srv := control.New(store, adminToken, pubBaseURL, js, placer)
+	srv := control.New(store, adminToken, pubBaseURL, nc, js, placer)
 
 	httpSrv := &http.Server{
 		Addr:              listen,
