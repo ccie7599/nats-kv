@@ -128,6 +128,8 @@ func (s *Server) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 }
 
 // bucketSummary enriches a bucket with replica/leader/lag for topology UI.
+// Also discovers any mirror streams (KV_<bucket>_mirror_*) and reports their
+// placement + lag so the UI can render the full consistency-domain shape.
 func (s *Server) bucketSummary(name string) map[string]any {
 	entry := map[string]any{"name": name}
 	kv, err := s.cfg.JS.KeyValue(name)
@@ -141,8 +143,41 @@ func (s *Server) bucketSummary(name string) map[string]any {
 		entry["history"] = st.History()
 		entry["bytes"] = st.Bytes()
 	}
+	streamName := "KV_" + name
+
+	// Find mirror streams pointing at this bucket.
+	mirrors := []map[string]any{}
+	for sn := range s.cfg.JS.StreamNames() {
+		if !strings.HasPrefix(sn, streamName+"_mirror_") {
+			continue
+		}
+		mi, err := s.cfg.JS.StreamInfo(sn)
+		if err != nil || mi == nil {
+			continue
+		}
+		m := map[string]any{
+			"stream": sn,
+			"messages": mi.State.Msgs,
+		}
+		if mi.Mirror != nil {
+			m["lag_msgs"] = mi.Mirror.Lag
+			m["active_ms"] = mi.Mirror.Active.Milliseconds()
+		}
+		if mi.Config.Placement != nil {
+			m["placement_tags"] = mi.Config.Placement.Tags
+		}
+		if mi.Cluster != nil {
+			m["leader"] = mi.Cluster.Leader
+			m["cluster"] = mi.Cluster.Name
+		}
+		mirrors = append(mirrors, m)
+	}
+	if len(mirrors) > 0 {
+		entry["mirrors"] = mirrors
+	}
+
 	// Stream backing the KV bucket has name "KV_<bucket>"
-	if info, err := s.cfg.JS.StreamInfo("KV_" + name); err == nil && info != nil {
+	if info, err := s.cfg.JS.StreamInfo(streamName); err == nil && info != nil {
 		entry["replicas"] = info.Config.Replicas
 		entry["mirror"] = info.Config.Mirror
 		entry["sources"] = info.Config.Sources
