@@ -46,7 +46,7 @@ func NewKeyCache(js nats.JetStreamContext, demoToken string) *KeyCache {
 
 func (c *KeyCache) run() {
 	for {
-		kv, err := c.js.KeyValue("kv-admin-keys")
+		kv, err := c.js.KeyValue("kv-admin-keys-v2")
 		if err != nil {
 			// Bucket may not be replicated to this node yet, or control plane hasn't started.
 			time.Sleep(10 * time.Second)
@@ -58,7 +58,7 @@ func (c *KeyCache) run() {
 			time.Sleep(10 * time.Second)
 			continue
 		}
-		log.Printf("keys watch started on kv-admin-keys")
+		log.Printf("keys watch started on kv-admin-keys-v2")
 		for upd := range w.Updates() {
 			if upd == nil {
 				// nil = end of initial replay, watch is now live

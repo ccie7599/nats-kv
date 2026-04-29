@@ -25,7 +25,7 @@ type Store struct {
 
 func NewStore(js nats.JetStreamContext, db *sql.DB) (*Store, error) {
 	tb, err := openOrCreate(js, &nats.KeyValueConfig{
-		Bucket:      "kv-admin-tenants",
+		Bucket:      "kv-admin-tenants-v2",
 		Description: "tenant records, watched by adapters for live state",
 		History:     8,
 		Storage:     nats.FileStorage,
@@ -35,7 +35,7 @@ func NewStore(js nats.JetStreamContext, db *sql.DB) (*Store, error) {
 		return nil, fmt.Errorf("tenants bucket: %w", err)
 	}
 	kb, err := openOrCreate(js, &nats.KeyValueConfig{
-		Bucket:      "kv-admin-keys",
+		Bucket:      "kv-admin-keys-v2",
 		Description: "API key hash records, watched by adapters",
 		History:     8,
 		Storage:     nats.FileStorage,

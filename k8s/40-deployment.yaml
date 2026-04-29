@@ -38,7 +38,7 @@ spec:
       # Read DEMO_TOKEN from Vault-injected file at startup
       containers:
         - name: adapter
-          image: harbor.harbor.svc.cluster.local/presales/nats-kv-adapter:v0.1.3
+          image: harbor.harbor.svc.cluster.local/presales/nats-kv-adapter:v0.1.4
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
