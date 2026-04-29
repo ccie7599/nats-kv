@@ -570,9 +570,9 @@ function selectBucket(i) {
   activeBucket = i;
   document.querySelectorAll(".bucket-row").forEach((el, j) => el.classList.toggle("active", j === i));
   const b = currentBuckets[i];
-  // overlay: triangle of peer points + leader ring
   const overlay = document.getElementById("overlay");
   overlay.innerHTML = "";
+  // RAFT peers
   const pts = (b.peers || []).map(p => {
     const r = regionFromPeer(p.name);
     const m = REGIONS[r];
@@ -587,6 +587,20 @@ function selectBucket(i) {
     overlay.insertAdjacentHTML("beforeend", `<polygon points="${poly}" class="raft-fill" style="fill:${color}"/>`);
     overlay.insertAdjacentHTML("beforeend", `<polyline points="${poly} ${pts[0].x.toFixed(1)},${pts[0].y.toFixed(1)}" class="raft-edge" style="stroke:${color}"/>`);
   }
+  // RAFT centroid for mirror dashed lines
+  let cx = 0, cy = 0; for (const p of pts) { cx += p.x; cy += p.y; }
+  if (pts.length) { cx /= pts.length; cy /= pts.length; }
+  // Mirror replicas
+  const mirrors = (b.mirrors || []).map(m => {
+    const leaderRegion = m.leader ? regionFromPeer(m.leader) : null;
+    if (!leaderRegion || !REGIONS[leaderRegion]) return null;
+    const [x,y] = proj(REGIONS[leaderRegion].lat, REGIONS[leaderRegion].lon);
+    return { x, y, region: leaderRegion, lag_msgs: m.lag_msgs||0, tags: m.placement_tags||[] };
+  }).filter(Boolean);
+  for (const m of mirrors) {
+    overlay.insertAdjacentHTML("beforeend", `<line x1="${cx.toFixed(1)}" y1="${cy.toFixed(1)}" x2="${m.x.toFixed(1)}" y2="${m.y.toFixed(1)}" stroke="#bc8cff" stroke-width="1" stroke-dasharray="3 3" opacity="0.6"/>`);
+    overlay.insertAdjacentHTML("beforeend", `<circle cx="${m.x}" cy="${m.y}" r="3" fill="#bc8cff"><title>mirror in ${m.region} (lag ${m.lag_msgs} msgs)</title></circle>`);
+  }
   for (const p of pts) {
     if (p.role === "leader") {
       overlay.insertAdjacentHTML("beforeend", `<circle cx="${p.x}" cy="${p.y}" r="14" fill="url(#leader-glow)"/>`);
@@ -597,9 +611,10 @@ function selectBucket(i) {
   // detail
   const det = document.getElementById("detail-out");
   det.innerHTML = `
-    <div><strong>${b.name}</strong> <span class="pill ${repClass}">R${b.replicas||1}</span></div>
+    <div><strong>${b.name}</strong> <span class="pill ${repClass}">R${b.replicas||1}</span> ${(b.mirrors||[]).length ? `<span class="pill mirror">+${b.mirrors.length} mirrors</span>` : ''}</div>
     <div class="meta">cluster: ${b.cluster||'?'} · values: ${b.values||0} · bytes: ${b.bytes||0} · history: ${b.history||0}</div>
-    <table style="width:100%; margin-top:8px; font-size:12px;">
+    <h3 style="font-size:13px; margin:12px 0 4px">RAFT replicas</h3>
+    <table style="width:100%; font-size:12px;">
       <thead><tr><th style="text-align:left">Peer</th><th>Role</th><th>Current</th><th>Lag (ms)</th></tr></thead>
       <tbody>${(b.peers||[]).map(p => `
         <tr>
@@ -609,6 +624,18 @@ function selectBucket(i) {
           <td class="lag ${p.lag_ms<10?'ok':p.lag_ms<100?'warn':'err'}">${p.lag_ms||0}</td>
         </tr>`).join("")}</tbody>
     </table>
+    ${(b.mirrors||[]).length ? `
+    <h3 style="font-size:13px; margin:12px 0 4px">Async mirrors (read replicas)</h3>
+    <table style="width:100%; font-size:12px;">
+      <thead><tr><th style="text-align:left">Stream</th><th>Leader</th><th>Tags</th><th>Lag (msgs)</th></tr></thead>
+      <tbody>${(b.mirrors||[]).map(m => `
+        <tr>
+          <td>${m.stream}</td>
+          <td>${m.leader||'?'}</td>
+          <td>${(m.placement_tags||[]).join(',')}</td>
+          <td class="lag ${m.lag_msgs<5?'ok':m.lag_msgs<50?'warn':'err'}">${m.lag_msgs||0}</td>
+        </tr>`).join("")}</tbody>
+    </table>` : ''}
   `;
   document.getElementById("bucket-detail").style.display = "block";
 }
