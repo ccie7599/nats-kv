@@ -23,6 +23,9 @@ async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
     if path == "/topology" || path == "/topology/" {
         return html(TOPOLOGY_HTML);
     }
+    if path == "/docs" || path == "/docs/" {
+        return html(DOCS_HTML);
+    }
     if path.starts_with("/claim/") {
         return html(CLAIM_HTML);
     }
@@ -345,6 +348,7 @@ function renderNav(active) {
       <a href="/play" ${active==='play'?'style="text-decoration:underline"':''}>playground</a>
       <a href="/topology" ${active==='topology'?'style="text-decoration:underline"':''}>topology</a>
       <a href="/dash" ${active==='dash'?'style="text-decoration:underline"':''}>dashboard</a>
+      <a href="/docs" ${active==='docs'?'style="text-decoration:underline"':''}>docs</a>
       <span class="key-status ${k?'ok':''}">${k ? 'signed in: '+t+' • key '+k.slice(0,12)+'…' : 'no key (using shared demo)'}</span>
     </nav>
   `);
@@ -1166,6 +1170,279 @@ async function natsCluster() {
 }
 
 loadPlayBuckets();
+</script>
+</body></html>
+"##;
+
+const DOCS_HTML: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"><title>NATS-KV — docs</title><style>__SHARED_CSS__
+  .toc { position:sticky; top:8px; float:right; width:220px; margin:0 0 16px 16px; padding:10px; border:1px solid #30363d; border-radius:4px; background:#0d1117; font-size:12px; }
+  .toc a { display:block; padding:2px 0; color:#8b949e; text-decoration:none; }
+  .toc a:hover { color:#58a6ff; }
+  h2 { margin-top:32px; padding-top:8px; border-top:1px solid #21262d; }
+  h3 { margin-top:18px; }
+  pre { background:#0d1117; border:1px solid #30363d; border-radius:4px; padding:10px; overflow-x:auto; font-size:12px; }
+  pre code { background:none; padding:0; font-size:12px; }
+  table.cmp { width:100%; border-collapse:collapse; font-size:13px; margin:8px 0; }
+  table.cmp th, table.cmp td { padding:6px 10px; border-bottom:1px solid #30363d; text-align:left; vertical-align:top; }
+  table.cmp th { background:#161b22; font-weight:600; }
+  table.cmp .yes { color:#3fb950; }
+  table.cmp .no  { color:#f85149; }
+  table.cmp .partial { color:#d29922; }
+  .api { margin:8px 0 16px; padding:10px; border-left:3px solid #30363d; background:#0d1117; border-radius:0 4px 4px 0; }
+  .api .verb { display:inline-block; padding:2px 6px; border-radius:3px; font-size:11px; font-weight:600; margin-right:6px; }
+  .api .verb.GET    { background:#1f6feb; color:white; }
+  .api .verb.PUT    { background:#3fb950; color:#0d1117; }
+  .api .verb.POST   { background:#bc8cff; color:#0d1117; }
+  .api .verb.DELETE { background:#f85149; color:white; }
+  .callout { padding:10px 14px; border-radius:4px; margin:12px 0; font-size:13px; }
+  .callout.warn { background:#3a2a0d; border:1px solid #d29922; }
+  .callout.note { background:#0e2a3a; border:1px solid #1f6feb; }
+</style></head><body>
+<h1>NATS-KV for Akamai Functions — docs &amp; API guide</h1>
+<p class="sub">Globally distributed NATS JetStream KV with HTTP API, fronted by GTM across 27 regions. Built as a research POC to explore what a stronger backing store for Akamai Functions could look like.</p>
+
+<aside class="toc">
+  <a href="#intro">1. What is this?</a>
+  <a href="#vs-cosmos">2. vs Cosmos (Spin's default)</a>
+  <a href="#architecture">3. Architecture (1 page)</a>
+  <a href="#quickstart">4. Quickstart</a>
+  <a href="#api">5. API reference</a>
+  <a href="#sample">6. Sample Spin function</a>
+  <a href="#unique">7. NATS-unique features</a>
+  <a href="#perf">8. Perf characteristics</a>
+  <a href="#caveats">9. Caveats &amp; status</a>
+</aside>
+
+<h2 id="intro">1. What is this?</h2>
+<p>An HTTP-fronted, globally replicated key-value store designed for Akamai Functions (Fermyon Spin). Each of 27 Linode regions runs an adapter process with embedded NATS JetStream; functions reach the nearest one through GTM at <code>edge.nats-kv.connected-cloud.io</code>. The cluster is a single super-mesh — buckets pick a RAFT geo (NA/EU/AP) and read mirrors are placed in every other region for sub-millisecond local reads.</p>
+<p>The point of the experiment: Spin's default <code>spin:key-value</code> WIT only exposes get/set/delete against a managed Cosmos-backed store. That covers the common case, but anything richer — atomic increment, revision history, subject-pattern key wildcards, distributed locks, watches — has to leave the function and go elsewhere. NATS KV exposes all of those primitives natively. We wrapped the cluster in an HTTP adapter so any Spin function (or any HTTP client) can use them today, without waiting for a native <code>key-value-nats</code> Spin factor crate.</p>
+
+<h2 id="vs-cosmos">2. NATS-KV vs Cosmos (Spin's default backend)</h2>
+<table class="cmp">
+  <thead><tr><th>Capability</th><th>Cosmos (Spin default)</th><th>NATS-KV (this)</th></tr></thead>
+  <tbody>
+    <tr><td>get / set / delete</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+    <tr><td>Atomic increment / counter</td><td class="no">✗ (read-modify-write race)</td><td class="yes">✓ (<code>POST /:key/incr</code>)</td></tr>
+    <tr><td>Revision history per key</td><td class="no">✗</td><td class="yes">✓ (configurable depth, default 8)</td></tr>
+    <tr><td>Compare-and-swap (CAS)</td><td class="no">✗</td><td class="yes">✓ (<code>If-Match</code> / <code>If-None-Match</code>)</td></tr>
+    <tr><td>Subject-pattern key match</td><td class="no">✗ (exact key only)</td><td class="yes">✓ (<code>users.*.session</code>)</td></tr>
+    <tr><td>Live watch / SSE</td><td class="no">✗</td><td class="yes">✓ (browser EventSource, server clients)</td></tr>
+    <tr><td>Distributed lock recipe</td><td class="no">✗ (no CAS to build it)</td><td class="yes">✓ (CAS + TTL pattern)</td></tr>
+    <tr><td>Geographic placement control</td><td class="no">✗ (managed)</td><td class="yes">✓ (R1/R3/R5 with geo:na|eu|ap tags)</td></tr>
+    <tr><td>Read locality</td><td class="partial">~ (managed POPs)</td><td class="yes">✓ (per-region mirror at every node)</td></tr>
+    <tr><td>Per-tenant isolation</td><td class="yes">✓ (per-app store)</td><td class="yes">✓ (tenant-prefixed buckets)</td></tr>
+    <tr><td>Call shape from Spin</td><td>in-process WIT (no network)</td><td>HTTP via wasi-http (one network hop today; native crate possible later)</td></tr>
+    <tr><td>Steady-state read latency from FWF (intra-CHI)</td><td>18-22ms</td><td>3-9ms (local mirror) / 25-50ms (cross-region depending on GTM mapping)</td></tr>
+    <tr><td>Production support / SLA</td><td class="yes">✓ (Akamai-managed)</td><td class="no">✗ (demo-grade — see §9)</td></tr>
+  </tbody>
+</table>
+<p class="meta">The latency advantage flips both ways: NATS-KV is faster than Cosmos when the local mirror is reachable in one hop, and slower when GTM routes the function to a non-local NB (the in-process WIT path Cosmos uses has zero network cost).</p>
+
+<h2 id="architecture">3. Architecture (one page)</h2>
+<ul>
+  <li><b>27 regions, each running one adapter</b> = a Go binary embedding <code>nats-server</code> with JetStream + a small HTTP API. Single super-cluster mesh (one NATS account globally).</li>
+  <li><b>Buckets</b>: NATS JetStream KV. Tier choices: <b>R1</b> (single replica, max throughput), <b>R3</b> (RAFT, durable, ~30ms quorum write within a geo), <b>R5</b> (RAFT spread across more peers in the geo).</li>
+  <li><b>Read mirrors</b>: every bucket auto-creates a one-replica mirror in every region (27 per bucket). Adapter reads always hit the mirror local to the node serving the request → sub-ms.</li>
+  <li><b>Placement engine</b>: when you pick <code>geo: auto</code>, the control plane queries <code>project-latency</code> for the live RTT matrix, scores each geo's median quorum edge from your anchor, and picks the winner. Decision is returned in the create response and rendered in the dashboard.</li>
+  <li><b>GTM</b>: <code>edge.nats-kv.connected-cloud.io</code> resolves to the closest healthy adapter per Akamai's perf scoring. (Note: ECS isn't on for this domain yet — perf routing falls back to per-resolver mapping. Affects which leaf FWF lands on.)</li>
+  <li><b>Auth</b>: bearer token in <code>Authorization: Bearer &lt;key&gt;</code>. Tenants are minted by an admin app (invite → claim flow).</li>
+</ul>
+<p>For the live picture see <a href="/topology">/topology</a>.</p>
+
+<h2 id="quickstart">4. Quickstart</h2>
+<ol>
+  <li>Open <a href="/">the home page</a> and either claim an invite link (you'll get a key) or use the open <code>akv_demo_open</code> token for the shared <code>demo</code> bucket.</li>
+  <li>Set <code>Authorization: Bearer &lt;key&gt;</code> on every request.</li>
+  <li>Hit the GTM endpoint:
+    <pre><code>curl -H "Authorization: Bearer akv_demo_open" \
+     https://edge.nats-kv.connected-cloud.io/v1/kv/demo/hello
+
+curl -X PUT -H "Authorization: Bearer akv_demo_open" \
+     --data 'world' \
+     https://edge.nats-kv.connected-cloud.io/v1/kv/demo/hello</code></pre>
+  </li>
+  <li>To create your own bucket (after claiming a tenant key), POST to the control plane:
+    <pre><code>curl -X POST -H "Authorization: Bearer $YOUR_KEY" \
+     -H "Content-Type: application/json" \
+     -d '{"name":"sessions","replicas":3,"geo":"auto","anchor":"us-ord"}' \
+     https://cp.nats-kv.connected-cloud.io/v1/me/buckets</code></pre>
+    The response includes the placement <b>Decision</b> showing which geo was picked and why.</li>
+</ol>
+
+<h2 id="api">5. API reference</h2>
+<p>Two services, both bearer-auth'd:</p>
+<ul>
+  <li><b>Data plane</b> (adapter, GTM-routed): <code>https://edge.nats-kv.connected-cloud.io/v1/...</code> — bucket reads/writes/history/incr.</li>
+  <li><b>Control plane</b> (LZ-only): <code>https://cp.nats-kv.connected-cloud.io/v1/...</code> — tenants, buckets, placement preview.</li>
+</ul>
+
+<h3>Data-plane endpoints</h3>
+
+<div class="api"><span class="verb GET">GET</span><code>/v1/kv/:bucket/:key</code>
+  <p>Read the latest value. Response body is the raw value bytes; <code>X-Revision</code>, <code>X-Read-Source</code> (<code>local-mirror</code> or <code>source</code>), <code>X-Read-Stream</code>, <code>X-Latency-Ms</code> headers describe how it was served. Add <code>?revision=&lt;n&gt;</code> for a specific historical revision.</p>
+</div>
+
+<div class="api"><span class="verb PUT">PUT</span><code>/v1/kv/:bucket/:key</code>
+  <p>Write. Body is the value. Optional <code>If-Match: &lt;revision&gt;</code> for compare-and-swap (returns 412 if mismatch); <code>If-None-Match: *</code> for create-if-absent.</p>
+  <p>Response: <code>{"revision":&lt;n&gt;}</code>.</p>
+</div>
+
+<div class="api"><span class="verb DELETE">DELETE</span><code>/v1/kv/:bucket/:key</code>
+  <p>Tombstone the key. Optional <code>If-Match</code> for CAS delete. Subsequent GET returns 404.</p>
+</div>
+
+<div class="api"><span class="verb GET">GET</span><code>/v1/kv/:bucket/:key/history</code>
+  <p>All revisions still in history (default depth = 8). Returns JSON: <code>[{"revision":1,"value_b64":"..."}, ...]</code>.</p>
+</div>
+
+<div class="api"><span class="verb POST">POST</span><code>/v1/kv/:bucket/:key/incr</code>
+  <p>Atomic counter. Body: <code>{"by":1}</code>. Returns the new value. Treats missing key as 0. NATS-side it's a CAS loop on the underlying revision so it's safe under concurrent writers.</p>
+</div>
+
+<div class="api"><span class="verb GET">GET</span><code>/v1/kv/:bucket/keys?match=&lt;subject-pattern&gt;</code>
+  <p>List keys matching a NATS subject pattern. <code>users.*.session</code>, <code>users.&gt;</code> (everything under <code>users</code>), etc. Returns <code>{"keys":[...]}</code>.</p>
+  <p class="meta">This is the headline NATS-only feature — subject wildcards work because NATS KV stores entries on <code>$KV.&lt;bucket&gt;.&lt;key&gt;</code> subjects.</p>
+</div>
+
+<div class="api"><span class="verb GET">GET</span><code>/v1/admin/buckets</code>
+  <p>List every bucket on the cluster with placement, peers, and mirror count. Used by the topology page.</p>
+</div>
+
+<div class="api"><span class="verb GET">GET</span><code>/v1/admin/cluster</code>
+  <p>Returns <code>{"region":"us-ord","server":"kv-us-ord","local_mirrors":{...}}</code> — useful in functions to know which leaf you landed on.</p>
+</div>
+
+<div class="api"><span class="verb GET">GET</span><code>/v1/health</code>
+  <p>Liveness probe. Returns <code>{"status":"ok","region":"..."}</code>. Open (no auth).</p>
+</div>
+
+<h3>Control-plane endpoints</h3>
+
+<div class="api"><span class="verb GET">GET</span><code>/v1/me</code>
+  <p>Returns the calling tenant's identity, quotas, and endpoint hints. Bearer = user key.</p>
+</div>
+
+<div class="api"><span class="verb GET">GET</span><code>/v1/me/buckets</code>
+  <p>List the calling tenant's buckets with enriched details (replicas, leader, peers, placement_tags, mirror_count).</p>
+</div>
+
+<div class="api"><span class="verb POST">POST</span><code>/v1/me/buckets</code>
+  <p>Create a bucket. Body:</p>
+  <pre><code>{
+  "name": "sessions",            // tenant prefix added automatically
+  "replicas": 3,                 // 1 | 3 | 5
+  "geo": "auto",                 // auto | anchor:&lt;region&gt; | na | eu | ap | sa
+  "anchor": "us-ord",            // hint for "auto" mode (default us-ord)
+  "history": 8,                  // revisions to keep per key
+  "no_mirrors": false            // opt-out of mirrors-everywhere
+}</code></pre>
+  <p>Response includes a <code>placement</code> Decision: chosen geo, predicted regions, actual regions NATS picked, expected write latency, runner-up alternatives.</p>
+</div>
+
+<div class="api"><span class="verb GET">GET</span><code>/v1/placement/preview?anchor=&amp;replicas=&amp;mode=</code>
+  <p>Run the placement engine without creating a bucket. Lets the dashboard preview the decision before you commit.</p>
+</div>
+
+<h2 id="sample">6. Sample Spin function (Rust)</h2>
+<p>Here's a Spin <code>wasi-http</code> handler that uses NATS-KV as a session store with subject-pattern lookup — something Cosmos can't express:</p>
+
+<pre><code>use spin_sdk::http::{IntoResponse, Method, Request, Response, send};
+use spin_sdk::http_component;
+
+const KV_BASE: &amp;str = "http://edge.nats-kv.connected-cloud.io:8080";
+// Token from your tenant claim flow. In production, inject via Spin variables.
+const KV_KEY:  &amp;str = "akv_int_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+const BUCKET:  &amp;str = "your_tenant__sessions";
+
+#[http_component]
+async fn handle_request(req: Request) -&gt; anyhow::Result&lt;impl IntoResponse&gt; {
+    let user = req.header("x-user-id").and_then(|v| v.as_str())
+        .unwrap_or("anonymous").to_string();
+    let id = uuid_v4_or_whatever();
+
+    // Write a session with subject-style key — this enables wildcard query later.
+    let put = Request::builder()
+        .method(Method::Put)
+        .uri(format!("{KV_BASE}/v1/kv/{BUCKET}/users.{user}.{id}.session"))
+        .header("Authorization", format!("Bearer {KV_KEY}"))
+        .body(b"active".to_vec())
+        .build();
+    let _: Response = send(put).await?;
+
+    // List all active sessions for this user (impossible in Cosmos).
+    let q = Request::builder()
+        .method(Method::Get)
+        .uri(format!("{KV_BASE}/v1/kv/{BUCKET}/keys?match=users.{user}.*.session"))
+        .header("Authorization", format!("Bearer {KV_KEY}"))
+        .body(Vec::&lt;u8&gt;::new())
+        .build();
+    let resp: Response = send(q).await?;
+
+    Ok(Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        .body(resp.into_body())
+        .build())
+}</code></pre>
+
+<p>And the same idea but using <b>atomic increment</b> as a request counter — a NATS-only primitive:</p>
+
+<pre><code>let req = Request::builder()
+    .method(Method::Post)
+    .uri(format!("{KV_BASE}/v1/kv/{BUCKET}/req-counter.{path}/incr"))
+    .header("Authorization", format!("Bearer {KV_KEY}"))
+    .header("content-type", "application/json")
+    .body(br#"{"by":1}"#.to_vec())
+    .build();
+let resp: Response = send(req).await?;
+// resp body = the new counter value, atomic across all 27 regions.</code></pre>
+
+<div class="callout note">
+  <b>Spin runtime tip</b>: Spin's HTTP client (<code>wasi:http/outgoing-handler</code>) pools connections per function instance. The first call from a cold instance pays a TCP+TLS setup (~50-200ms); subsequent calls reuse the connection (~5-10ms). For latency-sensitive paths, do a no-op warmup at instance init.
+</div>
+
+<h2 id="unique">7. NATS-unique features (vs the Spin KV WIT)</h2>
+<ul>
+  <li><b>Atomic increment</b> — a CAS loop on the value's revision; safe under N concurrent writers without read-modify-write races.</li>
+  <li><b>Revision history</b> — last 8 versions per key by default, queryable individually. Good for "undo last write" or audit.</li>
+  <li><b>Subject-pattern wildcards</b> — keys live on NATS subjects, so <code>match=users.*.session</code> or <code>match=foo.&gt;</code> work natively. No table scan.</li>
+  <li><b>Compare-and-swap</b> (<code>If-Match: &lt;rev&gt;</code>) — the building block for distributed locks, leader election, idempotency keys, rate limiters.</li>
+  <li><b>Geographic placement choice</b> — pick the geo (and survive geo-level failures with R5 spread).</li>
+  <li><b>Per-region mirror reads</b> — every region has a local mirror by default; reads are sub-ms.</li>
+  <li><b>Live watch via SSE</b> — long-lived browser/server clients see changes without polling. (Not used inside functions because Spin's request-response shape doesn't fit long-lived watches.)</li>
+</ul>
+
+<h2 id="perf">8. Perf characteristics (steady-state from FWF, Chicago)</h2>
+<table class="cmp">
+  <thead><tr><th>Path</th><th>Read (ms)</th><th>Write (ms)</th></tr></thead>
+  <tbody>
+    <tr><td>NATS R1, GTM lands on us-ord</td><td>3-4</td><td>3-4</td></tr>
+    <tr><td>NATS R3, GTM lands on us-ord, leader=us-ord</td><td>3-4</td><td>~33 (quorum cost)</td></tr>
+    <tr><td>NATS R3, GTM lands on ca-central, leader=us-ord</td><td>~25 (FWF↔ca-central)</td><td>~50 (FWF↔ca-central + cross-region forward)</td></tr>
+    <tr><td>Cosmos via spin:key-value WIT</td><td>18-22</td><td>22-25</td></tr>
+  </tbody>
+</table>
+<p class="meta">Numbers are <code>upstream_us</code> from the playground (FWF Spin function ⇄ adapter, excluding browser↔FWF). NATS-KV beats Cosmos when GTM lands the function on the same region as the bucket's RAFT leader. The FWF↔adapter network hop is the floor — would close to zero with a native <code>key-value-nats</code> Spin factor crate (in-process WIT call instead of HTTP).</p>
+
+<h2 id="caveats">9. Caveats &amp; status</h2>
+<div class="callout warn">
+  <b>This is a research POC, not a production service.</b> Built to explore what a richer KV substrate for Akamai Functions could look like, what the placement engineering tradeoffs feel like in practice, and how much performance is leaving the table when functions go through a network hop instead of in-process WIT. Treat numbers as illustrative.
+</div>
+<ul>
+  <li><b>No SLA, no support, no on-call.</b> Demo cluster runs on the presales account. Buckets and tenants can be wiped without notice (and have been — see project DECISIONS.md ADR-022).</li>
+  <li><b>Auth is bearer-token only.</b> No EAA, no per-key ACL granularity, no quotas enforcement beyond storage exhaustion.</li>
+  <li><b>Storage tier is single block volume per region.</b> If a Linode block volume goes away, R1 buckets on that node are gone. R3/R5 survive single-node loss.</li>
+  <li><b>Spin's HTTP path is the latency floor.</b> Until a native <code>key-value-nats</code> Spin factor crate exists, every function call to NATS-KV pays one wasi-http hop (~5-10ms steady state to the local NB, more if GTM routes elsewhere).</li>
+  <li><b>GTM ECS is currently off on the shared domain</b> — affects which leaf functions land on. Backend request open to enable it.</li>
+  <li><b>Watches via SSE</b> work for browser/long-lived clients but aren't usable from inside functions (Spin's request-response shape).</li>
+  <li><b>What this is meant to inform</b>: should Akamai consider exposing a richer KV WIT to function authors? Should the Cosmos backend grow CAS / counters / wildcards? Is there appetite for a NATS-class store as an alternative backend behind <code>spin:key-value</code>? This demo gives concrete data to answer those.</li>
+</ul>
+
+<p class="meta" style="margin-top:32px;">Source: <a href="https://github.com/ccie7599/nats-kv">github.com/ccie7599/nats-kv</a> · SCOPE.md and 22 ADRs in DECISIONS.md document every architecture choice, with the misses documented honestly.</p>
+
+<script>__NAV_JS__
+renderNav('docs');
 </script>
 </body></html>
 "##;
