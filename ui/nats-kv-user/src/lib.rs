@@ -34,6 +34,29 @@ async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
             .build());
     }
 
+    // /api/whereami — Spin function calls an IP-echo service so we can see where
+    // FWF is actually egressing from (FWF's outbound IP, geo).
+    if path == "/api/whereami" {
+        let mut b = Request::builder();
+        b.method(Method::Get);
+        b.uri("https://ipinfo.io/json");
+        b.header("Accept", "application/json");
+        b.body(Vec::<u8>::new());
+        let t0 = std::time::Instant::now();
+        let upstream: Response = spin_sdk::http::send(b.build()).await?;
+        let elapsed_us = t0.elapsed().as_micros();
+        let body_b64 = b64encode(upstream.body());
+        let payload = format!(
+            r#"{{"upstream_us":{elapsed_us},"status":{},"body_b64":"{body_b64}"}}"#,
+            *upstream.status() as u16,
+        );
+        return Ok(Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(payload)
+            .build());
+    }
+
     // /api/nats/<path...>  — proxy to NATS adapter using caller's bearer key (or fallback)
     if let Some(rest) = path.strip_prefix("/api/nats/") {
         let key = caller_bearer(&req).unwrap_or_else(|| FALLBACK_TOKEN.to_string());
