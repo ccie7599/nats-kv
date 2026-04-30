@@ -182,12 +182,19 @@ func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListBuckets(w http.ResponseWriter, r *http.Request) {
-	tenant, ok := s.authTenant(r)
-	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
+	// Accept EITHER an admin bearer (sees everything) or a tenant bearer
+	// (sees only their own + demo). Admin token isn't in the keys cache, so
+	// adminOK has to be checked before authTenant or admin would 401.
 	isAdmin := s.adminOK(r)
+	var tenant string
+	if !isAdmin {
+		t, ok := s.authTenant(r)
+		if !ok {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		tenant = t
+	}
 	w.Header().Set("Content-Type", "application/json")
 	// Snapshot all stream names ONCE so each bucketSummary doesn't re-enumerate
 	// the cluster (was the second-biggest contributor to slow topology refresh).
