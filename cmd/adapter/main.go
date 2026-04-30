@@ -28,6 +28,7 @@ func main() {
 	clusterPort := envInt("NATS_CLUSTER_PORT", 6222)
 	monitorPort := envInt("NATS_MONITOR_PORT", 8222)
 	demoToken := envOr("DEMO_TOKEN", "akv_demo_open")
+	adminToken := os.Getenv("ADMIN_TOKEN") // empty disables /v1/admin/* (fail-closed)
 	natsRoutes := os.Getenv("NATS_ROUTES") // comma-separated nats-route:// URLs
 
 	if err := os.MkdirAll(jsDir, 0o755); err != nil {
@@ -94,6 +95,7 @@ func main() {
 		NC:         nc,
 		DemoToken:  demoToken,
 		ControlURL: envOr("CONTROL_URL", "https://cp.nats-kv.connected-cloud.io"),
+		AdminToken: adminToken,
 	})
 
 	httpSrv := &http.Server{

@@ -24,12 +24,19 @@ spec:
         prometheus.io/port: "8222"
         prometheus.io/path: "/varz"
         # Vault Agent injector — renders /vault/secrets/demo-token from api/nats-kv/config
+        # and /vault/secrets/admin-token from api/nats-kv/control (same path the
+        # control plane reads). Adapter uses ADMIN_TOKEN to gate /v1/admin/*.
         vault.hashicorp.com/agent-inject: "true"
         vault.hashicorp.com/role: "api"
         vault.hashicorp.com/agent-inject-secret-demo-token: "api/data/nats-kv/config"
         vault.hashicorp.com/agent-inject-template-demo-token: |
           {{- with secret "api/data/nats-kv/config" -}}
           {{ .Data.data.demo_token }}
+          {{- end -}}
+        vault.hashicorp.com/agent-inject-secret-admin-token: "api/data/nats-kv/control"
+        vault.hashicorp.com/agent-inject-template-admin-token: |
+          {{- with secret "api/data/nats-kv/control" -}}
+          {{ .Data.data.admin_token }}
           {{- end -}}
     spec:
       serviceAccountName: app-vault-access
@@ -38,12 +45,13 @@ spec:
       # Read DEMO_TOKEN from Vault-injected file at startup
       containers:
         - name: adapter
-          image: harbor.harbor.svc.cluster.local/presales/nats-kv-adapter:v0.2.5
+          image: harbor.harbor.svc.cluster.local/presales/nats-kv-adapter:v0.2.6
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
             - |
               export DEMO_TOKEN="$(cat /vault/secrets/demo-token)"
+              export ADMIN_TOKEN="$(cat /vault/secrets/admin-token)"
               exec /usr/local/bin/kv-adapter
           env:
             - name: REGION

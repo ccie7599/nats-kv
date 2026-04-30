@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,9 @@ type Config struct {
 	NC         *nats.Conn
 	DemoToken  string
 	ControlURL string
+	// AdminToken gates /v1/admin/* — same value the control plane uses.
+	// Empty disables admin endpoints entirely (safer than open).
+	AdminToken string
 }
 
 type Server struct {
@@ -155,6 +159,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
+	if !s.adminOK(r) {
+		http.Error(w, "admin token required", http.StatusUnauthorized)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	info, _ := s.cfg.JS.AccountInfo()
 	s.mu.RLock()
@@ -174,10 +182,12 @@ func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListBuckets(w http.ResponseWriter, r *http.Request) {
-	if !s.authOK(r) {
+	tenant, ok := s.authTenant(r)
+	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	isAdmin := s.adminOK(r)
 	w.Header().Set("Content-Type", "application/json")
 	// Snapshot all stream names ONCE so each bucketSummary doesn't re-enumerate
 	// the cluster (was the second-biggest contributor to slow topology refresh).
@@ -185,13 +195,28 @@ func (s *Server) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 	for sn := range s.cfg.JS.StreamNames() {
 		allStreams = append(allStreams, sn)
 	}
+	// Filter the bucket list before fanning out summaries:
+	//   - admin bearer:    every bucket on the cluster (current behavior)
+	//   - any other bearer: tenant's own buckets (prefix `<tenant_id>__`) + the
+	//                       shared `demo` bucket. System buckets (kv-admin-*)
+	//                       are never returned to non-admin callers.
+	prefix := tenant + "__"
+	names := []string{}
+	for n := range s.cfg.JS.KeyValueStoreNames() {
+		if isAdmin {
+			names = append(names, n)
+			continue
+		}
+		if strings.HasPrefix(n, "kv-admin") {
+			continue
+		}
+		if n == "demo" || strings.HasPrefix(n, prefix) {
+			names = append(names, n)
+		}
+	}
 	// Parallelize per-bucket lookups — each StreamInfo crosses to the source's
 	// leader region, so 5 sequential = 5 × cross-region RTT (~3s). Fan out and
 	// the wall-clock cost becomes max(per-bucket) ≈ one cross-region RTT.
-	names := []string{}
-	for n := range s.cfg.JS.KeyValueStoreNames() {
-		names = append(names, n)
-	}
 	out := make([]map[string]any, len(names))
 	var wg sync.WaitGroup
 	for i, n := range names {
@@ -339,6 +364,20 @@ func (s *Server) authOK(r *http.Request) bool {
 	}
 	_, ok := s.keys.Validate(got)
 	return ok
+}
+
+// adminOK gates /v1/admin/* endpoints. Constant-time compare to the
+// configured admin token; if the token is empty, ALL admin endpoints
+// are denied — fail closed when the deployment forgets to wire it.
+func (s *Server) adminOK(r *http.Request) bool {
+	if s.cfg.AdminToken == "" {
+		return false
+	}
+	got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if got == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.AdminToken)) == 1
 }
 
 // authTenant returns (tenant_id, ok) for the request's bearer token.
