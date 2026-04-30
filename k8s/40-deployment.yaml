@@ -112,10 +112,10 @@ spec:
           resources:
             requests:
               cpu: 200m
-              memory: 256Mi
+              memory: 1Gi
             limits:
               cpu: 1500m
-              memory: 1Gi
+              memory: 4Gi
           volumeMounts:
             - name: jetstream
               mountPath: /var/lib/nats/jetstream
