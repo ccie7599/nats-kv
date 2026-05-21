@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -163,6 +164,14 @@ type createBucketReq struct {
 	Anchor    string `json:"anchor,omitempty"` // hint to placement engine when geo=auto (e.g. "fr-par-2")
 	History   uint8  `json:"history"`  // KV history depth
 	NoMirrors bool   `json:"no_mirrors,omitempty"` // opt-OUT — by default we mirror to every region
+
+	// ChangeStreamTopic (ADR-007 / nats-mq C9) — when set, every write to this
+	// bucket is bridged to the named topic on nats-mq. Mapping is persisted in
+	// kv-admin-change-streams-v1 so the bridge runtime (on shared-cluster
+	// deployments) or the HTTP-forward runtime (cross-cluster) can pick it up.
+	// Unlocks CQRS / real-time UI / audit-by-default patterns with a single
+	// config flag.
+	ChangeStreamTopic string `json:"change_stream_topic,omitempty"`
 }
 
 // allRegions: the 27 KV cluster peers, used to spread per-region read mirrors.
@@ -264,6 +273,18 @@ func (s *Server) createUserBucket(w http.ResponseWriter, r *http.Request, t *ten
 	}
 	s.store.Audit(r.Context(), t.ID, "bucket.create", "bucket", bucketName, auditMsg)
 
+	// ADR-007: cross-product flag. Record the bucket → mq-topic mapping so the
+	// bridge runtime (shared-cluster: NATS-native; cross-cluster: HTTP forward)
+	// can fan KV writes out to the named nats-mq topic.
+	if req.ChangeStreamTopic != "" {
+		if err := s.recordChangeStreamMapping(r.Context(), t.ID, bucketName, req.ChangeStreamTopic); err != nil {
+			// Non-fatal — bucket is already created. Log + surface in response.
+			log.Printf("change_stream_topic: failed to record mapping for %s -> %s: %v", bucketName, req.ChangeStreamTopic, err)
+		} else {
+			s.store.Audit(r.Context(), t.ID, "bucket.change-stream-mapping", "bucket", bucketName, "topic="+req.ChangeStreamTopic)
+		}
+	}
+
 	resp := map[string]any{
 		"bucket":       bucketName,
 		"replicas":     req.Replicas,
@@ -273,6 +294,11 @@ func (s *Server) createUserBucket(w http.ResponseWriter, r *http.Request, t *ten
 		"mirror_count": len(mirrors),
 		"endpoint":     "https://edge.nats-kv.connected-cloud.io",
 		"sample_url":   "https://edge.nats-kv.connected-cloud.io/v1/kv/" + bucketName + "/<key>",
+	}
+	if req.ChangeStreamTopic != "" {
+		resp["change_stream_topic"] = req.ChangeStreamTopic
+		resp["change_stream_target_subject"] = "t." + t.ID + "__" + req.ChangeStreamTopic
+		resp["change_stream_note"] = "bridge runtime fans every $KV." + bucketName + ".> write to the named nats-mq topic; ensure the topic exists on the MQ side"
 	}
 	if decision != nil {
 		resp["placement"] = decision
@@ -1094,3 +1120,43 @@ func parseDuration(s string) (time.Duration, error) {
 }
 
 var _ = context.TODO // ensure context import retained
+
+// recordChangeStreamMapping persists the bucket → MQ-topic mapping that the
+// bridge runtime (or HTTP-forward shim) reads to fan KV writes out to
+// nats-mq. The mapping lives in a dedicated admin bucket so it's visible
+// from every region for the bridge to pick up (ADR-007 / nats-mq C9).
+func (s *Server) recordChangeStreamMapping(ctx context.Context, tenantID, bucketName, topic string) error {
+	kv, err := s.js.KeyValue("kv-admin-change-streams-v1")
+	if err != nil {
+		// Lazy-create the bucket on first use. R5/NA placement consistent with
+		// other admin buckets (ADR-022) so it's available everywhere.
+		kv, err = s.js.CreateKeyValue(&nats.KeyValueConfig{
+			Bucket:      "kv-admin-change-streams-v1",
+			Description: "Per-bucket change-stream-topic mappings (nats-mq cross-product bridge)",
+			Replicas:    5,
+			History:     5,
+			Placement:   &nats.Placement{Tags: []string{"geo:NA"}},
+		})
+		if err != nil {
+			return fmt.Errorf("create change-streams bucket: %w", err)
+		}
+	}
+	type mapping struct {
+		TenantID    string    `json:"tenant_id"`
+		BucketName  string    `json:"bucket_name"`
+		TargetTopic string    `json:"target_topic"`
+		CreatedAt   time.Time `json:"created_at"`
+	}
+	rec := mapping{
+		TenantID:    tenantID,
+		BucketName:  bucketName,
+		TargetTopic: topic,
+		CreatedAt:   time.Now().UTC(),
+	}
+	payload, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	_, err = kv.Put(bucketName, payload)
+	return err
+}
