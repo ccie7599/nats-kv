@@ -1654,6 +1654,7 @@ const DOCS_HTML: &str = r##"<!doctype html>
     <tr><td>Subject-pattern key match</td><td class="no">✗ (exact key only)</td><td class="yes">✓ (<code>users.*.session</code>)</td></tr>
     <tr><td>Live watch / SSE</td><td class="no">✗</td><td class="yes">✓ (browser EventSource, server clients)</td></tr>
     <tr><td>Distributed lock recipe</td><td class="no">✗ (no CAS to build it)</td><td class="yes">✓ (CAS + TTL pattern)</td></tr>
+    <tr><td>Key expiry / TTL</td><td class="no">✗ (manual sweeper)</td><td class="yes">✓ (per-bucket <code>max_age_seconds</code> + per-key <code>?ttl=</code>)</td></tr>
     <tr><td>Geographic placement control</td><td class="no">✗ (managed)</td><td class="yes">✓ (R1/R3/R5 with geo:na|eu|ap tags)</td></tr>
     <tr><td>Read locality</td><td class="partial">~ (managed POPs)</td><td class="yes">✓ (per-region mirror at every node)</td></tr>
     <tr><td>Per-tenant isolation</td><td class="yes">✓ (per-app store)</td><td class="yes">✓ (tenant-prefixed buckets)</td></tr>
@@ -1722,7 +1723,9 @@ curl -X PUT -H "Authorization: Bearer akv_demo_open" \
 
 <div class="api"><span class="verb PUT">PUT</span><code>/v1/kv/:bucket/:key</code>
   <p>Write. Body is the value. Optional <code>If-Match: &lt;revision&gt;</code> for compare-and-swap (returns 412 if mismatch); <code>If-None-Match: *</code> for create-if-absent.</p>
+  <p><b>Per-key TTL</b>: add <code>?ttl=&lt;seconds&gt;</code> (or header <code>X-TTL-Seconds: &lt;seconds&gt;</code>) and the key auto-deletes that many seconds after this write. A subsequent GET returns 404 once it expires — on the local mirror too, so reads everywhere reflect the expiry. Requires the bucket to be created with <code>allow_msg_ttl: true</code>; otherwise the TTL is silently ignored. Composes with the CAS headers (both ride on the same write). Backed by NATS Server 2.11+ per-message TTL — no sweeper.</p>
   <p>Response: <code>{"revision":&lt;n&gt;}</code>.</p>
+  <p class="meta">Use it for ephemeral state — presence keys, leases, locks, idempotency markers — that should clean themselves up: <code>PUT /v1/kv/presence/worker-7?ttl=30</code> refreshed on a heartbeat means "gone 30s after the worker stops."</p>
 </div>
 
 <div class="api"><span class="verb DELETE">DELETE</span><code>/v1/kv/:bucket/:key</code>
@@ -1772,9 +1775,12 @@ curl -X PUT -H "Authorization: Bearer akv_demo_open" \
   "geo": "auto",                 // auto | anchor:&lt;region&gt; | na | eu | ap | sa
   "anchor": "us-ord",            // hint for "auto" mode (default us-ord)
   "history": 8,                  // revisions to keep per key
-  "no_mirrors": false            // opt-out of mirrors-everywhere
+  "no_mirrors": false,           // opt-out of mirrors-everywhere
+  "max_age_seconds": 0,          // bucket-wide TTL; 0 = never expire
+  "allow_msg_ttl": false         // enable per-key ?ttl= writes on this bucket
 }</code></pre>
   <p>Response includes a <code>placement</code> Decision: chosen geo, predicted regions, actual regions NATS picked, expected write latency, runner-up alternatives.</p>
+  <p><b>TTL knobs.</b> <code>max_age_seconds</code> sets a bucket-wide expiry — every key is removed this long after its last write (good for session stores, rate-limit windows, ephemeral demo buckets). <code>allow_msg_ttl</code> opts the bucket in to <i>per-key</i> TTL, so individual writes can carry <code>?ttl=&lt;seconds&gt;</code> and expire independently. Set both if you want a default ceiling plus per-key overrides. Both apply to the read mirrors too, so expiry is visible from every region.</p>
 </div>
 
 <div class="api"><span class="verb GET">GET</span><code>/v1/placement/preview?anchor=&amp;replicas=&amp;mode=</code>
@@ -2481,7 +2487,7 @@ info:
     Globally distributed NATS JetStream KV with HTTP API, fronted by GTM
     across 27 regions. Demo-grade research POC — see /docs for status,
     architecture, and Cosmos comparison.
-  version: 0.2.5
+  version: 0.3.0
 servers:
   - url: https://edge.nats-kv.connected-cloud.io
     description: Data plane (GTM-routed to nearest of 27 regions)
@@ -2566,6 +2572,8 @@ components:
         anchor: { type: string, description: 'hint for auto mode (default us-ord)' }
         history: { type: integer, default: 8, description: 'revisions to keep per key' }
         no_mirrors: { type: boolean, default: false }
+        max_age_seconds: { type: integer, format: int64, default: 0, description: 'bucket-wide TTL in seconds; every key expires this long after its last write. 0 = never expire' }
+        allow_msg_ttl: { type: boolean, default: false, description: 'enable per-key TTL on this bucket; required before writes may use the ttl param / X-TTL-Seconds header' }
 paths:
   /v1/health:
     get:
@@ -2602,6 +2610,8 @@ paths:
         - { in: path, name: key,    required: true, schema: { type: string } }
         - { in: header, name: If-Match,      required: false, schema: { type: integer }, description: 'CAS — only write if current revision matches' }
         - { in: header, name: If-None-Match, required: false, schema: { type: string },  description: 'set to * to create-if-absent' }
+        - { in: query,  name: ttl,           required: false, schema: { type: integer }, description: 'per-key TTL in seconds; key auto-deletes this long after the write. Requires bucket created with allow_msg_ttl: true (else ignored)' }
+        - { in: header, name: X-TTL-Seconds, required: false, schema: { type: integer }, description: 'alternative to the ttl query param; same effect' }
       requestBody:
         required: true
         content:
