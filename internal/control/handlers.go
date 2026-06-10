@@ -410,6 +410,12 @@ func (s *Server) materializeBucket(bucketName string, replicas int, history uint
 	// everywhere, every region serves reads sub-ms.
 	for _, region := range allRegions {
 		mirrorName := srcStream + "_mirror_" + region
+		// Mirrors must carry the SAME TTL config as the source — reads are served
+		// from the local-region mirror (ADR-020), so if the mirror lacks MaxAge /
+		// AllowMsgTTL it keeps serving values the source has already expired.
+		// Mirrored messages preserve the Nats-TTL header + original timestamp, so
+		// with AllowMsgTTL=true the mirror expires each key in lockstep with the
+		// source; MaxAge handles the bucket-wide case.
 		_, err := s.js.AddStream(&nats.StreamConfig{
 			Name:         mirrorName,
 			Mirror:       &nats.StreamSource{Name: srcStream},
@@ -419,6 +425,8 @@ func (s *Server) materializeBucket(bucketName string, replicas int, history uint
 			AllowDirect:  true,
 			MirrorDirect: true,
 			Duplicates:   2 * time.Minute,
+			MaxAge:       maxAge,
+			AllowMsgTTL:  allowMsgTTL,
 		})
 		if err == nil || errors.Is(err, nats.ErrStreamNameAlreadyInUse) {
 			mirrors = append(mirrors, mirrorName)
