@@ -38,7 +38,10 @@ fn is_ui_authed(req: &Request) -> bool {
 // Paths that don't require the UI gate. Everything else does.
 fn is_public_path(path: &str) -> bool {
     matches!(path,
-        "/health" | "/api/request-invite"
+        "/health" | "/api/request-invite" | "/logout"
+        | "/docs" | "/docs/"                 // architecture page open to all visitors
+        | "/api-explorer" | "/api-explorer/" // Swagger-style API explorer (Try-It still needs auth)
+        | "/openapi.yaml"                    // raw spec so external tooling can fetch it
     )
     || path.starts_with("/claim/")           // existing claim flow stays open
     || path.starts_with("/static/")          // future static assets
@@ -145,6 +148,26 @@ async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
             .build());
     }
 
+    // /logout — clear the UI gate cookie so the next request hits the gate
+    // page. Useful for re-testing the fresh-visitor flow without juggling
+    // browser profiles, and for share recipients who want to "sign out".
+    if path == "/logout" {
+        let expired = format!("{UI_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure");
+        let body = r##"<!doctype html><html><head><meta charset="utf-8"><title>Signed out</title>
+<style>body{font-family:ui-monospace,monospace;background:#0d1117;color:#c9d1d9;max-width:540px;margin:60px auto;padding:24px}
+a{color:#58a6ff}</style></head><body>
+<h2>Signed out of the UI gate.</h2>
+<p>The gate cookie has been cleared. Visit <a href="/">/</a> to see the request-invite page,
+or paste a fresh access token if you have one.</p>
+</body></html>"##;
+        return Ok(Response::builder()
+            .status(200)
+            .header("content-type", "text/html; charset=utf-8")
+            .header("set-cookie", expired)
+            .body(body.to_string())
+            .build());
+    }
+
     // /api/probe-ip — hit the us-ord NB by IP (no DNS lookup), plain HTTP. Diff vs
     // /api/nats by hostname approximates DNS resolution cost on the FWF Spin path.
     if path == "/api/probe-ip" {
@@ -237,7 +260,14 @@ async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
         let key = caller_bearer(&req).unwrap_or_else(|| FALLBACK_TOKEN.to_string());
         let qs = req.query();
         let path_with_qs = if qs.is_empty() { rest.to_string() } else { format!("{rest}?{qs}") };
-        return Ok(call_nats(req.method().clone(), &path_with_qs, req.body(), &key).await?);
+        // Pass-through headers the adapter actually acts on. Without these the
+        // proxy silently strips CAS preconditions and content-type, making the
+        // adapter behave as if every PUT were unconditional.
+        let if_match = req.header("if-match").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let if_none_match = req.header("if-none-match").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let content_type = req.header("content-type").and_then(|v| v.as_str()).map(|s| s.to_string());
+        return Ok(call_nats(req.method().clone(), &path_with_qs, req.body(), &key,
+                            if_match, if_none_match, content_type).await?);
     }
 
     // /api/cosmos/<bucket>/<key> — Spin's managed KV (Cosmos backend on FWF)
@@ -271,14 +301,25 @@ fn caller_bearer(req: &Request) -> Option<String> {
     req.header("x-kv-key").and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
-async fn call_nats(method: Method, path: &str, body: &[u8], token: &str) -> anyhow::Result<Response> {
+async fn call_nats(
+    method: Method,
+    path: &str,
+    body: &[u8],
+    token: &str,
+    if_match: Option<String>,
+    if_none_match: Option<String>,
+    caller_content_type: Option<String>,
+) -> anyhow::Result<Response> {
     let url = format!("{ADAPTER_BASE}/{path}");
     let mut builder = Request::builder();
     builder.method(method);
     builder.uri(url);
     builder.header("Authorization", format!("Bearer {token}"));
+    if let Some(v) = if_match { builder.header("If-Match", v); }
+    if let Some(v) = if_none_match { builder.header("If-None-Match", v); }
+    let ct = caller_content_type.unwrap_or_else(|| "application/octet-stream".to_string());
     if !body.is_empty() {
-        builder.header("Content-Type", "application/octet-stream");
+        builder.header("Content-Type", ct);
         builder.body(body.to_vec());
     } else {
         builder.body(Vec::<u8>::new());
@@ -469,8 +510,56 @@ function renderNav(active) {
       <a href="/docs" ${active==='docs'?'style="text-decoration:underline"':''}>docs</a>
       <a href="/api-explorer" ${active==='api'?'style="text-decoration:underline"':''}>API</a>
       <span class="key-status ${k?'ok':''}">${k ? 'signed in: '+t+' • key '+k.slice(0,12)+'…' : 'no key (using shared demo)'}</span>
+      <a href="#" onclick="confirmLogout(event)" style="color:#f85149">logout</a>
     </nav>
   `);
+}
+
+// Logout means clearing the UI gate cookie (sends you back to the
+// request-invite page) AND optionally wiping the KV bearer key from
+// localStorage. The bearer is what actually authenticates KV calls — if
+// you don't save it before logging out, you can't get back in without
+// asking the admin for a new invite. Show it once more before nuking.
+function confirmLogout(ev) {
+  if (ev) ev.preventDefault();
+  const k = userKey();
+  const wrap = document.createElement("div");
+  wrap.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:9999;";
+  const keyBlock = k ? `
+    <p style="margin:12px 0 4px;color:#d29922"><b>Save your KV bearer key first.</b> It's what authenticates every API call — losing it means asking the admin for a new invite to get back in.</p>
+    <input id="lo-key" readonly value="${k}" onclick="this.select()"
+           style="width:100%;background:#0d1117;color:#3fb950;border:1px solid #30363d;border-radius:4px;padding:8px;font-family:ui-monospace,monospace;font-size:12px;box-sizing:border-box;" />
+    <div style="margin-top:8px"><button id="lo-copy" style="background:#58a6ff;color:#0d1117;border:0;padding:6px 12px;border-radius:4px;font-weight:600;font-family:inherit;cursor:pointer">Copy key</button>
+    <span id="lo-status" style="margin-left:8px;font-size:12px;color:#8b949e"></span></div>
+    <label style="display:flex;align-items:center;gap:6px;margin-top:14px;font-size:12px;color:#c9d1d9"><input type="checkbox" id="lo-wipe" style="width:auto"> also wipe my saved KV key from this browser</label>
+  ` : `<p style="margin:12px 0;color:#8b949e">No KV key is stored in this browser — logging out just clears the UI gate cookie.</p>`;
+  wrap.innerHTML = `
+    <div style="background:#161b22;border:1px solid #f85149;border-radius:6px;padding:20px;max-width:560px;width:90%;font-family:ui-monospace,monospace;color:#c9d1d9;">
+      <h3 style="margin:0 0 8px;color:#f85149">Logging out</h3>
+      <p style="margin:0;color:#8b949e;font-size:13px">This clears the UI gate cookie and sends you back to the request-invite page. <em>It does not</em> revoke your KV bearer key.</p>
+      ${keyBlock}
+      <div style="display:flex;gap:8px;margin-top:16px;justify-content:flex-end">
+        <button id="lo-cancel" style="background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:8px 14px;border-radius:4px;font-family:inherit;cursor:pointer">Cancel</button>
+        <button id="lo-go" style="background:#f85149;color:#0d1117;border:0;padding:8px 14px;border-radius:4px;font-weight:600;font-family:inherit;cursor:pointer">Log out</button>
+      </div>
+    </div>`;
+  document.body.appendChild(wrap);
+  const cleanup = () => wrap.remove();
+  document.getElementById("lo-cancel").onclick = cleanup;
+  if (k) {
+    document.getElementById("lo-copy").onclick = async () => {
+      try { await navigator.clipboard.writeText(k);
+        document.getElementById("lo-status").innerHTML = '<span style="color:#3fb950">copied</span>';
+      } catch { document.getElementById("lo-status").innerHTML = '<span style="color:#d29922">clipboard blocked — select the field manually</span>'; }
+    };
+  }
+  document.getElementById("lo-go").onclick = () => {
+    if (k && document.getElementById("lo-wipe").checked) {
+      localStorage.removeItem(KEY);
+      localStorage.removeItem(TENANT);
+    }
+    window.location = "/logout";
+  };
 }
 function authedFetch(path, opts={}) {
   opts.headers = opts.headers || {};
@@ -611,7 +700,7 @@ const DASH_HTML: &str = r##"<!doctype html>
   <div id="placement-preview" class="meta" style="margin-top:8px; padding:8px; border:1px solid #30363d; border-radius:4px; background:#0d1117; display:none"></div>
   <div class="actions">
     <label style="display:flex; align-items:center; gap:6px; margin:0;"><input type="checkbox" id="b-mirrors" checked style="width:auto"> auto-create mirrors in other regions for local reads</label>
-    <button onclick="createBucket()">Create</button>
+    <button id="b-create-btn" onclick="createBucket()">Create</button>
   </div>
   <div id="create-out" class="meta" style="margin-top:6px"></div>
   <div id="create-decision" style="margin-top:6px; display:none"></div>
@@ -743,6 +832,9 @@ function renderPlacement(d) {
 }
 
 async function createBucket() {
+  const btn = document.getElementById("b-create-btn");
+  const out = document.getElementById("create-out");
+  if (btn.disabled) return;  // double-click guard
   const body = {
     name: document.getElementById("b-name").value.trim(),
     replicas: parseInt(document.getElementById("b-replicas").value, 10),
@@ -754,25 +846,45 @@ async function createBucket() {
     body.anchor = document.getElementById("b-anchor").value;
   }
   if (!body.name) { alert("name required"); return; }
-  const r = await authedFetch("/api/control/v1/me/buckets", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + userKey() },
-    body: JSON.stringify(body),
-  });
-  const j = await r.json();
-  if (!r.ok) { document.getElementById("create-out").innerHTML = `<span class="err">${j.error||r.status}</span>`; return; }
-  document.getElementById("create-out").innerHTML = `<span class="ok">created ${j.bucket}</span> · ${(j.mirrors||[]).length} mirrors`;
-  // Render the placement decision the server actually applied (matches preview
-  // when the user accepted defaults; differs if they manually picked a geo).
-  const decEl = document.getElementById("create-decision");
-  if (j.placement) {
-    decEl.style.display = "block";
-    decEl.innerHTML = `<div style="padding:8px; border:1px solid #30363d; border-radius:4px; background:#0d1117">${renderPlacement(j.placement)}</div>`;
-  } else {
-    decEl.style.display = "none";
+
+  // Provisioning a bucket can take 2-5s (RAFT placement query, source +
+  // mirror stream creation across regions). Lock the button and surface
+  // progress so the operator doesn't double-submit.
+  const originalLabel = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Creating…";
+  btn.style.opacity = "0.6";
+  btn.style.cursor = "wait";
+  out.innerHTML = `<span style="color:#58a6ff">provisioning bucket — picking placement, creating source stream, fanning out mirrors…</span>`;
+
+  try {
+    const r = await authedFetch("/api/control/v1/me/buckets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + userKey() },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (!r.ok) { out.innerHTML = `<span class="err">${j.error||r.status}</span>`; return; }
+    out.innerHTML = `<span class="ok">created ${j.bucket}</span> · ${(j.mirrors||[]).length} mirrors`;
+    // Render the placement decision the server actually applied (matches preview
+    // when the user accepted defaults; differs if they manually picked a geo).
+    const decEl = document.getElementById("create-decision");
+    if (j.placement) {
+      decEl.style.display = "block";
+      decEl.innerHTML = `<div style="padding:8px; border:1px solid #30363d; border-radius:4px; background:#0d1117">${renderPlacement(j.placement)}</div>`;
+    } else {
+      decEl.style.display = "none";
+    }
+    document.getElementById("b-name").value = "";
+    loadBuckets();
+  } catch (e) {
+    out.innerHTML = `<span class="err">create failed: ${e.message}</span>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+    btn.style.opacity = "";
+    btn.style.cursor = "";
   }
-  document.getElementById("b-name").value = "";
-  loadBuckets();
 }
 async function loadBuckets() {
   const r = await authedFetch("/api/control/v1/me/buckets", { headers: {"Authorization": "Bearer " + userKey()} });
@@ -782,14 +894,30 @@ async function loadBuckets() {
     tb.innerHTML = `<tr><td colspan="4" class="err">${j.error||r.status}</td></tr>`;
     return;
   }
-  const details = j.details || [];
+  const details = (j.details || []).slice();
+
+  // Always include the shared `demo` bucket — tenants don't own it but they
+  // can read/write it with their key, and the playground / verify / loadtest
+  // pages use it as the default. Pull placement details from /admin/buckets
+  // so the row matches the format of tenant-owned buckets.
+  try {
+    const ar = await fetch("/api/nats/v1/admin/buckets", { headers: {"X-KV-Key": userKey()} });
+    const aj = await ar.json();
+    const apayload = JSON.parse(atob(aj.body_b64 || ""));
+    const demo = (apayload.buckets || []).find(b => b.name === "demo");
+    if (demo && !details.find(b => b.name === "demo")) {
+      details.unshift({ ...demo, shared: true });
+    }
+  } catch (e) { /* if demo lookup fails, just show the tenant's own buckets */ }
+
   if (details.length === 0) {
     tb.innerHTML = '<tr><td colspan="4" class="meta">(no buckets yet — create one above)</td></tr>';
     return;
   }
   tb.innerHTML = details.map(b => {
     const peers = (b.peers||[]).map(p => p.name.replace('kv-','')).join(', ') || (b.leader||'').replace('kv-','');
-    return `<tr><td style="padding:6px;border-bottom:1px solid #30363d">${b.name}</td><td style="text-align:center;padding:6px;border-bottom:1px solid #30363d">R${b.replicas||'?'}</td><td class="meta" style="padding:6px;border-bottom:1px solid #30363d">${peers}</td><td style="text-align:center;padding:6px;border-bottom:1px solid #30363d">${b.mirror_count||0}</td></tr>`;
+    const label = b.shared ? `${b.name} <span class="meta">(shared)</span>` : b.name;
+    return `<tr><td style="padding:6px;border-bottom:1px solid #30363d">${label}</td><td style="text-align:center;padding:6px;border-bottom:1px solid #30363d">R${b.replicas||'?'}</td><td class="meta" style="padding:6px;border-bottom:1px solid #30363d">${peers}</td><td style="text-align:center;padding:6px;border-bottom:1px solid #30363d">${b.mirror_count||0}</td></tr>`;
   }).join("");
 }
 </script>
@@ -954,7 +1082,23 @@ async function loadAll() {
   // The proxy wraps result; actual body is base64 JSON
   let payload;
   try { payload = JSON.parse(atob(j.body_b64 || "")); } catch (e) { payload = j; }
-  currentBuckets = (payload.buckets || []).filter(b => !b.name.startsWith("kv-admin"));
+  // Scope the topology to the signed-in tenant: shared `demo` bucket plus
+  // anything `/v1/me/buckets` reports for them. Without this filter the page
+  // showed every other tenant's buckets too — cluster-wide /admin/buckets is
+  // unfiltered by design (it powers admin tools).
+  let allowed = new Set(["demo"]);
+  if (userKey()) {
+    try {
+      const meR = await fetch("/api/control/v1/me/buckets", { headers: {"Authorization": "Bearer " + userKey()} });
+      if (meR.ok) {
+        const meJ = await meR.json();
+        for (const n of (meJ.buckets || [])) allowed.add(n);
+      }
+    } catch (e) { /* fall back to demo-only */ }
+  }
+  currentBuckets = (payload.buckets || []).filter(b =>
+    !b.name.startsWith("kv-admin") && allowed.has(b.name)
+  );
   document.getElementById("b-count").textContent = `(${currentBuckets.length})`;
   const list = document.getElementById("bucket-list");
   list.innerHTML = currentBuckets.map((b, i) => {
@@ -1321,6 +1465,165 @@ const DOCS_HTML: &str = r##"<!doctype html>
 <h1>NATS-KV for Akamai Functions — docs &amp; API guide</h1>
 <p class="sub">Globally distributed NATS JetStream KV with HTTP API, fronted by GTM across 27 regions. Built as a research POC to explore what a stronger backing store for Akamai Functions could look like.</p>
 
+<svg viewBox="0 0 1100 520" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="NATS-KV system architecture"
+     style="display:block;width:100%;max-width:1100px;height:auto;margin:16px 0 24px;background:#0d1117;border:1px solid #30363d;border-radius:6px">
+  <defs>
+    <marker id="ah-grey" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#8b949e"/></marker>
+    <marker id="ah-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#58a6ff"/></marker>
+    <marker id="ah-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#3fb950"/></marker>
+    <marker id="ah-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#bc8cff"/></marker>
+    <marker id="ah-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#f85149"/></marker>
+  </defs>
+
+  <text x="20" y="22" fill="#c9d1d9" font-family="ui-monospace,monospace" font-size="13" font-weight="bold">NATS-KV — system architecture</text>
+  <text x="20" y="38" fill="#8b949e" font-family="ui-monospace,monospace" font-size="10">consumers → Akamai edge → 27-region NATS-KV super-mesh; control plane LZ-only</text>
+
+  <!-- ===== Tier 1: consumers ===== -->
+  <g font-family="ui-monospace,monospace" font-size="11" fill="#c9d1d9">
+    <rect x="40" y="58" width="220" height="80" rx="6" fill="#161b22" stroke="#30363d"/>
+    <text x="150" y="78" text-anchor="middle" font-weight="bold" fill="#58a6ff">Browser</text>
+    <text x="150" y="96" text-anchor="middle" fill="#8b949e" font-size="10">SPA · curl · SSE listener</text>
+    <text x="150" y="112" text-anchor="middle" fill="#8b949e" font-size="10">HTTPS, bearer token</text>
+    <text x="150" y="128" text-anchor="middle" fill="#8b949e" font-size="9">e.g. this UI; 3rd-party clients</text>
+
+    <rect x="290" y="58" width="220" height="80" rx="6" fill="#161b22" stroke="#30363d"/>
+    <text x="400" y="78" text-anchor="middle" font-weight="bold" fill="#58a6ff">External HTTP client</text>
+    <text x="400" y="96" text-anchor="middle" fill="#8b949e" font-size="10">any language, any runtime</text>
+    <text x="400" y="112" text-anchor="middle" fill="#8b949e" font-size="10">Rust · Go · Python · TS · Java</text>
+    <text x="400" y="128" text-anchor="middle" fill="#8b949e" font-size="9">no SDK; raw HTTP</text>
+
+    <rect x="540" y="58" width="220" height="80" rx="6" fill="#161b22" stroke="#3fb950"/>
+    <text x="650" y="78" text-anchor="middle" font-weight="bold" fill="#3fb950">Akamai Function (Spin)</text>
+    <text x="650" y="96" text-anchor="middle" fill="#8b949e" font-size="10">wasi-http to local adapter</text>
+    <text x="650" y="112" text-anchor="middle" fill="#8b949e" font-size="10">~5-10 ms steady-state per call</text>
+    <text x="650" y="128" text-anchor="middle" fill="#8b949e" font-size="9">target for native key-value-nats WIT</text>
+  </g>
+
+  <!-- arrows: consumers → GTM -->
+  <line x1="150" y1="138" x2="150" y2="170" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#ah-blue)"/>
+  <line x1="400" y1="138" x2="400" y2="170" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#ah-blue)"/>
+  <line x1="650" y1="138" x2="650" y2="170" stroke="#3fb950" stroke-width="1.5" marker-end="url(#ah-green)"/>
+
+  <!-- ===== Tier 2: Akamai GTM ===== -->
+  <g font-family="ui-monospace,monospace" font-size="11" fill="#c9d1d9">
+    <rect x="40" y="170" width="720" height="46" rx="6" fill="#161b22" stroke="#58a6ff"/>
+    <text x="400" y="191" text-anchor="middle" font-weight="bold" fill="#58a6ff">Akamai GTM — edge.nats-kv.connected-cloud.io</text>
+    <text x="400" y="206" text-anchor="middle" fill="#8b949e" font-size="10">geo-routing · client lands on the closest healthy adapter</text>
+  </g>
+
+  <!-- arrows: GTM → adapters -->
+  <line x1="125" y1="216" x2="125" y2="252" stroke="#58a6ff" stroke-width="1" marker-end="url(#ah-blue)"/>
+  <line x1="295" y1="216" x2="295" y2="252" stroke="#58a6ff" stroke-width="1" marker-end="url(#ah-blue)"/>
+  <line x1="445" y1="216" x2="445" y2="252" stroke="#58a6ff" stroke-width="1" marker-end="url(#ah-blue)"/>
+  <line x1="595" y1="216" x2="595" y2="252" stroke="#58a6ff" stroke-width="1" marker-end="url(#ah-blue)"/>
+  <line x1="715" y1="216" x2="715" y2="252" stroke="#58a6ff" stroke-width="1" marker-end="url(#ah-blue)"/>
+
+  <!-- ===== Tier 3: regions / NATS cluster ===== -->
+  <!-- Source RAFT cluster (3-node, depicted as one labelled box) -->
+  <g font-family="ui-monospace,monospace" fill="#c9d1d9">
+    <rect x="60" y="252" width="130" height="118" rx="6" fill="#0e2a17" stroke="#3fb950" stroke-width="2"/>
+    <text x="125" y="270" text-anchor="middle" font-weight="bold" fill="#3fb950" font-size="11">kv-us-ord</text>
+    <text x="125" y="285" text-anchor="middle" fill="#3fb950" font-size="9">★ R3 source (NA)</text>
+    <line x1="70" y1="293" x2="180" y2="293" stroke="#30363d"/>
+    <text x="125" y="308" text-anchor="middle" fill="#8b949e" font-size="9">HTTP adapter</text>
+    <text x="125" y="322" text-anchor="middle" fill="#8b949e" font-size="9">embedded NATS-JS</text>
+    <text x="125" y="336" text-anchor="middle" fill="#8b949e" font-size="9">block-volume WAL</text>
+    <text x="125" y="358" text-anchor="middle" fill="#3fb950" font-size="9" font-style="italic">RAFT consensus across</text>
+    <text x="125" y="368" text-anchor="middle" fill="#3fb950" font-size="9" font-style="italic">3 NA peers</text>
+  </g>
+
+  <g font-family="ui-monospace,monospace" fill="#c9d1d9">
+    <rect x="220" y="252" width="150" height="118" rx="6" fill="#161b22" stroke="#30363d"/>
+    <text x="295" y="270" text-anchor="middle" font-weight="bold" fill="#bc8cff" font-size="11">kv-eu-central</text>
+    <text x="295" y="285" text-anchor="middle" fill="#bc8cff" font-size="9">read mirror</text>
+    <line x1="230" y1="293" x2="360" y2="293" stroke="#30363d"/>
+    <text x="295" y="308" text-anchor="middle" fill="#8b949e" font-size="9">HTTP adapter</text>
+    <text x="295" y="322" text-anchor="middle" fill="#8b949e" font-size="9">local mirror stream</text>
+    <text x="295" y="336" text-anchor="middle" fill="#8b949e" font-size="9">sub-ms reads</text>
+  </g>
+
+  <g font-family="ui-monospace,monospace" fill="#c9d1d9">
+    <rect x="370" y="252" width="150" height="118" rx="6" fill="#161b22" stroke="#30363d"/>
+    <text x="445" y="270" text-anchor="middle" font-weight="bold" fill="#bc8cff" font-size="11">kv-jp-tyo-3</text>
+    <text x="445" y="285" text-anchor="middle" fill="#bc8cff" font-size="9">read mirror</text>
+    <line x1="380" y1="293" x2="510" y2="293" stroke="#30363d"/>
+    <text x="445" y="308" text-anchor="middle" fill="#8b949e" font-size="9">HTTP adapter</text>
+    <text x="445" y="322" text-anchor="middle" fill="#8b949e" font-size="9">local mirror stream</text>
+    <text x="445" y="336" text-anchor="middle" fill="#8b949e" font-size="9">sub-ms reads</text>
+  </g>
+
+  <g font-family="ui-monospace,monospace" fill="#c9d1d9">
+    <rect x="520" y="252" width="150" height="118" rx="6" fill="#161b22" stroke="#30363d"/>
+    <text x="595" y="270" text-anchor="middle" font-weight="bold" fill="#bc8cff" font-size="11">kv-br-gru</text>
+    <text x="595" y="285" text-anchor="middle" fill="#bc8cff" font-size="9">read mirror</text>
+    <line x1="530" y1="293" x2="660" y2="293" stroke="#30363d"/>
+    <text x="595" y="308" text-anchor="middle" fill="#8b949e" font-size="9">HTTP adapter</text>
+    <text x="595" y="322" text-anchor="middle" fill="#8b949e" font-size="9">local mirror stream</text>
+    <text x="595" y="336" text-anchor="middle" fill="#8b949e" font-size="9">sub-ms reads</text>
+  </g>
+
+  <g font-family="ui-monospace,monospace" fill="#c9d1d9">
+    <rect x="670" y="252" width="90" height="118" rx="6" fill="#161b22" stroke="#30363d" stroke-dasharray="4 3"/>
+    <text x="715" y="277" text-anchor="middle" fill="#8b949e" font-size="11">+ 22 more</text>
+    <text x="715" y="295" text-anchor="middle" fill="#8b949e" font-size="9">leaf regions,</text>
+    <text x="715" y="309" text-anchor="middle" fill="#8b949e" font-size="9">each running</text>
+    <text x="715" y="323" text-anchor="middle" fill="#8b949e" font-size="9">adapter +</text>
+    <text x="715" y="337" text-anchor="middle" fill="#8b949e" font-size="9">a local mirror</text>
+  </g>
+
+  <!-- mirror replication: source → each mirror (purple dashed) -->
+  <g stroke="#bc8cff" stroke-width="1" stroke-dasharray="3 3" fill="none">
+    <path d="M 190 280 Q 200 240 240 252" marker-end="url(#ah-purple)"/>
+    <path d="M 190 295 Q 290 235 390 252" marker-end="url(#ah-purple)"/>
+    <path d="M 190 310 Q 380 220 540 252" marker-end="url(#ah-purple)"/>
+    <path d="M 190 325 Q 470 230 685 254" marker-end="url(#ah-purple)"/>
+  </g>
+  <text x="430" y="245" text-anchor="middle" font-family="ui-monospace,monospace" fill="#bc8cff" font-size="10">source → 26 read mirrors (sub-second replication)</text>
+
+  <!-- ===== Side: Control plane ===== -->
+  <g font-family="ui-monospace,monospace" fill="#c9d1d9">
+    <rect x="800" y="58" width="270" height="312" rx="6" fill="#161b22" stroke="#f85149"/>
+    <text x="935" y="80" text-anchor="middle" font-weight="bold" fill="#f85149" font-size="13">Control plane</text>
+    <text x="935" y="96" text-anchor="middle" fill="#8b949e" font-size="9">cp.nats-kv.connected-cloud.io</text>
+    <text x="935" y="110" text-anchor="middle" fill="#8b949e" font-size="9">(LZ only — single instance)</text>
+    <line x1="810" y1="120" x2="1060" y2="120" stroke="#30363d"/>
+
+    <text x="935" y="142" text-anchor="middle" font-weight="bold" font-size="11">Tenancy</text>
+    <text x="935" y="158" text-anchor="middle" fill="#8b949e" font-size="9">tenants · invites · API keys</text>
+    <text x="935" y="172" text-anchor="middle" fill="#8b949e" font-size="9">audit log (R5 NA bucket)</text>
+
+    <text x="935" y="200" text-anchor="middle" font-weight="bold" font-size="11">Placement engine</text>
+    <text x="935" y="216" text-anchor="middle" fill="#8b949e" font-size="9">queries project-latency RTT matrix</text>
+    <text x="935" y="230" text-anchor="middle" fill="#8b949e" font-size="9">picks best RAFT geo per anchor</text>
+
+    <text x="935" y="258" text-anchor="middle" font-weight="bold" font-size="11">Bucket creation</text>
+    <text x="935" y="274" text-anchor="middle" fill="#8b949e" font-size="9">creates source stream + 26 mirrors</text>
+    <text x="935" y="288" text-anchor="middle" fill="#8b949e" font-size="9">forces RAFT leader to chosen geo</text>
+
+    <text x="935" y="316" text-anchor="middle" font-weight="bold" font-size="11">Admin API</text>
+    <text x="935" y="332" text-anchor="middle" fill="#8b949e" font-size="9">/v1/admin/* · admin bearer</text>
+    <text x="935" y="346" text-anchor="middle" fill="#8b949e" font-size="9">/v1/me/* · tenant bearer</text>
+  </g>
+
+  <!-- control plane → source region (one-shot at bucket-create) -->
+  <path d="M 800 240 Q 500 410 190 320" stroke="#f85149" stroke-width="1.2" stroke-dasharray="5 3" fill="none" marker-end="url(#ah-red)"/>
+  <text x="450" y="408" text-anchor="middle" font-family="ui-monospace,monospace" fill="#f85149" font-size="10">control-plane drives RAFT placement (one-shot per bucket create)</text>
+
+  <!-- Legend -->
+  <g font-family="ui-monospace,monospace" font-size="10" fill="#8b949e">
+    <text x="20" y="438" font-weight="bold" fill="#c9d1d9">Legend</text>
+    <line x1="20" y1="458" x2="50" y2="458" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#ah-blue)"/>
+    <text x="60" y="462">data-plane KV ops (HTTPS + bearer)</text>
+    <line x1="320" y1="458" x2="350" y2="458" stroke="#bc8cff" stroke-width="1" stroke-dasharray="3 3" marker-end="url(#ah-purple)"/>
+    <text x="360" y="462">mirror replication (one source → all leaves)</text>
+    <line x1="680" y1="458" x2="710" y2="458" stroke="#f85149" stroke-width="1.2" stroke-dasharray="5 3" marker-end="url(#ah-red)"/>
+    <text x="720" y="462">control-plane → source region (one-shot)</text>
+
+    <text x="20" y="486">★ R3 source = 3 NA regions sharing a RAFT log; the other 24 regions hold a single-replica mirror.</text>
+    <text x="20" y="502">  Reads always served by the local mirror — no cross-region hops on the read path.  Live picture: <tspan fill="#58a6ff">/topology</tspan>.</text>
+  </g>
+</svg>
+
 <aside class="toc">
   <a href="#intro">1. What is this?</a>
   <a href="#vs-cosmos">2. vs Cosmos (Spin's default)</a>
@@ -1332,6 +1635,8 @@ const DOCS_HTML: &str = r##"<!doctype html>
   <a href="#perf">8. Perf characteristics</a>
   <a href="#throughput">9. Throughput (projected)</a>
   <a href="#caveats">10. Caveats &amp; status</a>
+  <a href="#access">11. Access &amp; front-door</a>
+  <a href="#invite">12. Invite flow</a>
 </aside>
 
 <h2 id="intro">1. What is this?</h2>
@@ -1384,12 +1689,22 @@ curl -X PUT -H "Authorization: Bearer akv_demo_open" \
      --data 'world' \
      https://edge.nats-kv.connected-cloud.io/v1/kv/demo/hello</code></pre>
   </li>
-  <li>To create your own bucket (after claiming a tenant key), POST to the control plane:
+  <li>Create your own bucket (after claiming a tenant key). Two ways:
+    <p style="margin:10px 0 4px 0"><b>From the UI</b> (easiest):</p>
+    <ol style="margin-top:4px">
+      <li>Open <a href="/dash">/dash</a> — the "Create a bucket" form is visible once you're signed in with your tenant key.</li>
+      <li>Pick <b>name</b> (your tenant ID gets auto-prefixed so names don't collide between tenants).</li>
+      <li>Pick <b>replicas</b>: R1 (single node, max throughput, no durability), R3 (3-node RAFT, durable, default), R5 (5-node RAFT, geo-spread, survives a region pair loss).</li>
+      <li>Pick <b>geo</b>: <code>auto</code> queries <code>project-latency</code> for the live RTT matrix and picks whichever geo has the best median quorum-edge from your <b>anchor region</b>; or pin <code>na</code>/<code>eu</code>/<code>ap</code>/<code>sa</code> explicitly.</li>
+      <li>Leave <b>auto-create mirrors</b> checked for sub-ms reads everywhere; uncheck if you only care about writes near the leader and want to skip the fan-out cost.</li>
+      <li>Click <b>Create</b>. The placement <b>Decision</b> renders inline (which geo won, RTT scores, anchor used) and the new bucket appears in <b>Your buckets</b>.</li>
+    </ol>
+    <p style="margin:10px 0 4px 0"><b>From the API</b> (same call the UI makes under the hood):</p>
     <pre><code>curl -X POST -H "Authorization: Bearer $YOUR_KEY" \
      -H "Content-Type: application/json" \
      -d '{"name":"sessions","replicas":3,"geo":"auto","anchor":"us-ord"}' \
      https://cp.nats-kv.connected-cloud.io/v1/me/buckets</code></pre>
-    The response includes the placement <b>Decision</b> showing which geo was picked and why.</li>
+    The JSON response includes the same placement <b>Decision</b>.</li>
 </ol>
 
 <h2 id="api">5. API reference</h2>
@@ -1625,10 +1940,6 @@ for k in recent:
     print(f"  {user} -> rev {put(f'tags.{user}.last_seen', 'recent')}")
 </code></pre>
 
-<div class="callout note">
-  <b>Spin runtime tip</b>: Spin's HTTP client (<code>wasi:http/outgoing-handler</code>) pools connections per function instance. The first call from a cold instance pays a TCP+TLS setup (~50-200ms); subsequent calls reuse the connection (~5-10ms). For latency-sensitive paths, do a no-op warmup at instance init. The same applies in reverse for the browser TS sample — keep-alive is per-tab.
-</div>
-
 <h2 id="unique">7. NATS-unique features (vs the Spin KV WIT)</h2>
 <ul>
   <li><b>Atomic increment</b> — a CAS loop on the value's revision; safe under N concurrent writers without read-modify-write races.</li>
@@ -1668,8 +1979,8 @@ for k in recent:
   </tbody>
 </table>
 
-<h3>Mirror fan-out write amplification (revised: Linode NICs sustain 4-6 Gbps, not 1)</h3>
-<p>Every write to an R3 source replicates to <b>24 mirrors</b>. Source's NIC budget is consumed by the fan-out — but Linode VMs sustain ~5 Gbps, so the fan-out tax is much less binding than the typical "1 Gbps NIC" assumption suggests:</p>
+<h3>Mirror fan-out write amplification</h3>
+<p>Every write to an R3 source replicates to <b>24 mirrors</b>. Source's NIC budget is consumed by the fan-out, but with Linode VMs sustaining ~5 Gbps the fan-out tax stays well below the NIC ceiling for typical small-payload workloads:</p>
 <table class="cmp">
   <thead><tr><th>Value size</th><th>Egress per write (24 mirrors)</th><th>NIC-bound ceiling per source (5 Gbps)</th><th>Effective ceiling (min of NIC, RAFT, IOPS)</th></tr></thead>
   <tbody>
@@ -1679,7 +1990,7 @@ for k in recent:
     <tr><td>100 KB</td><td>2.4 MB</td><td>~260 writes/sec</td><td><b>~260</b> (NIC-bound)</td></tr>
   </tbody>
 </table>
-<p class="meta">For typical small-payload workloads (≤ a few KB) the binding constraint is <b>RAFT quorum cost</b>, not network — that flips at ~10 KB and above where NIC fan-out dominates. <code>no_mirrors=true</code> on bucket creation removes the fan-out entirely (at the cost of losing local-mirror reads everywhere). Earlier draft of this table assumed a 1 Gbps NIC and undercounted by ~5×.</p>
+<p class="meta">For typical small-payload workloads (≤ a few KB) the binding constraint is <b>RAFT quorum cost</b>, not network — that flips at ~10 KB and above where NIC fan-out dominates. <code>no_mirrors=true</code> on bucket creation removes the fan-out entirely (at the cost of losing local-mirror reads everywhere).</p>
 
 <h3>Aggregate cluster throughput</h3>
 <table class="cmp">
@@ -1701,7 +2012,8 @@ for k in recent:
   <b>This is a research POC, not a production service.</b> Built to explore what a richer KV substrate for Akamai Functions could look like, what the placement engineering tradeoffs feel like in practice, and how much performance is leaving the table when functions go through a network hop instead of in-process WIT. Treat numbers as illustrative.
 </div>
 <ul>
-  <li><b>No SLA, no support, no on-call.</b> Demo cluster runs on the presales account. Buckets and tenants can be wiped without notice (and have been — see project DECISIONS.md ADR-022).</li>
+  <li><b>The function-to-KV call is HTTP plaintext today.</b> wasi-http from Spin to the adapter goes over port 80 — fine intra-region (private NIC), but a real product would need TLS. The structural fix is host-level persistent connections on the Functions platform: once those are available, every function call reuses a single warm TLS pconn to the local adapter and the per-call cost of crypto disappears. Until then, plaintext is the honest tradeoff.</li>
+  <li><b>No SLA, no support, no on-call.</b> Demo cluster runs on the presales account. Buckets and tenants can be wiped without notice.</li>
   <li><b>Auth is bearer-token only.</b> No EAA, no per-key ACL granularity, no quotas enforcement beyond storage exhaustion.</li>
   <li><b>Storage tier is single block volume per region.</b> If a Linode block volume goes away, R1 buckets on that node are gone. R3/R5 survive single-node loss.</li>
   <li><b>Spin's HTTP path is the latency floor.</b> Until a native <code>key-value-nats</code> Spin factor crate exists, every function call to NATS-KV pays one wasi-http hop (~5-10ms steady state to the local NB, more if GTM routes elsewhere).</li>
@@ -1710,7 +2022,29 @@ for k in recent:
   <li><b>What this is meant to inform</b>: should Akamai consider exposing a richer KV WIT to function authors? Should the Cosmos backend grow CAS / counters / wildcards? Is there appetite for a NATS-class store as an alternative backend behind <code>spin:key-value</code>? This demo gives concrete data to answer those.</li>
 </ul>
 
-<p class="meta" style="margin-top:32px;">Source: <a href="https://github.com/ccie7599/nats-kv">github.com/ccie7599/nats-kv</a> · SCOPE.md and 22 ADRs in DECISIONS.md document every architecture choice, with the misses documented honestly.</p>
+<h2 id="access">11. How access &amp; the front-door work</h2>
+<p>Three independent gates, by design:</p>
+<ol>
+  <li><b>UI gate token</b> — unlocks <i>this page</i>. Set as cookie when you arrive via an invite share URL (or paste the token on the gate page). The whole UI sits behind it; without it you only see the gate / "Request invite" form.</li>
+  <li><b>KV bearer</b> — what you send as <code>Authorization: Bearer akv_...</code> on every API call. Per-tenant, minted at <code>/claim</code> when you accept an invite, listed in <code>/dash</code>.</li>
+  <li><b>Admin bearer</b> — only used by the admin app, never exposed to demo visitors. Lets the holder grant invites, list tenants, regen keys.</li>
+</ol>
+<p>The Akamai front-door is a single property (<code>nats-kv.connected-cloud.io</code>) with two hostnames serving two Spin apps off per-host rules:</p>
+<ul>
+  <li><code>nats-kv.connected-cloud.io</code> → <code>nats-kv-user</code> Spin app (this UI)</li>
+  <li><code>nats-kv-admin.connected-cloud.io</code> → <code>nats-kv-admin</code> Spin app (admin console; gated separately)</li>
+</ul>
+<p>Both share the <code>sse.connected-cloud.io</code> SAN cert (Enhanced TLS, enrollment 293468). Both log to DataStream 2 → ClickHouse → Grafana <code>nats-kv</code> dashboard. Direct Functions URLs (<code>*.fwf.app</code>) are also live and bypass Akamai if you want raw FWF→origin behavior for comparison.</p>
+
+<h2 id="invite">12. Invite flow (no link? request one)</h2>
+<p>Brand-new visitors hit the gate page and submit name + email + reason. The request lands in NATS KV bucket <code>kv-admin-invite-requests-v1</code> (R5/NA — admin store). Brian sees pending requests in the admin app, clicks Approve, and the admin app emits a complete share URL that combines:</p>
+<ul>
+  <li><code>?access=&lt;ui-gate&gt;</code> — sets the UI cookie on first hit</li>
+  <li><code>/claim/&lt;invite-token&gt;</code> — runs the tenant-claim flow that mints a fresh KV bearer</li>
+</ul>
+<p>One click and the user lands on <code>/dash</code> with everything provisioned. No password, no signup form past the original request.</p>
+
+<p class="meta" style="margin-top:32px;">Source: <a href="https://github.com/ccie7599/nats-kv">github.com/ccie7599/nats-kv</a></p>
 
 <script>__NAV_JS__
 renderNav('docs');

@@ -165,6 +165,15 @@ type createBucketReq struct {
 	History   uint8  `json:"history"`  // KV history depth
 	NoMirrors bool   `json:"no_mirrors,omitempty"` // opt-OUT — by default we mirror to every region
 
+	// MaxAgeSeconds — bucket-wide TTL. Any key untouched for this long is
+	// removed. Zero (default) = never expire. Useful for ephemeral demo
+	// buckets, session stores, rate-limit windows.
+	MaxAgeSeconds uint32 `json:"max_age_seconds,omitempty"`
+	// AllowMsgTTL — opt-in to per-key TTL on this bucket. When true, writes
+	// may carry `X-TTL-Seconds: <n>` (or `?ttl=<n>`) and the adapter sets
+	// `Nats-TTL` on the underlying publish. Requires NATS Server 2.11+.
+	AllowMsgTTL bool `json:"allow_msg_ttl,omitempty"`
+
 	// ChangeStreamTopic (ADR-007 / nats-mq C9) — when set, every write to this
 	// bucket is bridged to the named topic on nats-mq. Mapping is persisted in
 	// kv-admin-change-streams-v1 so the bridge runtime (on shared-cluster
@@ -261,7 +270,8 @@ func (s *Server) createUserBucket(w http.ResponseWriter, r *http.Request, t *ten
 	}
 
 	mirrors, err := s.materializeBucket(bucketName, req.Replicas, req.History, decision, !req.NoMirrors,
-		"tenant="+t.ID+" name="+req.Name)
+		"tenant="+t.ID+" name="+req.Name,
+		time.Duration(req.MaxAgeSeconds)*time.Second, req.AllowMsgTTL)
 	if err != nil {
 		writeJSON(w, 500, map[string]any{"error": err.Error()})
 		return
@@ -311,13 +321,14 @@ func (s *Server) createUserBucket(w http.ResponseWriter, r *http.Request, t *ten
 // region the source's RAFT doesn't already cover. Idempotent on the source —
 // if it already exists, mirrors are still ensured. Returns the list of mirror
 // stream names created (or already present).
-func (s *Server) materializeBucket(bucketName string, replicas int, history uint8, decision *placement.Decision, withMirrors bool, description string) ([]string, error) {
+func (s *Server) materializeBucket(bucketName string, replicas int, history uint8, decision *placement.Decision, withMirrors bool, description string, maxAge time.Duration, allowMsgTTL bool) ([]string, error) {
 	cfg := &nats.KeyValueConfig{
 		Bucket:      bucketName,
 		History:     history,
 		Storage:     nats.FileStorage,
 		Replicas:    replicas,
 		Description: description,
+		TTL:         maxAge, // bucket-wide MaxAge; zero = never expire
 	}
 	if decision != nil && decision.PlacementTag != "" {
 		cfg.Placement = &nats.Placement{Tags: []string{decision.PlacementTag}}
@@ -335,12 +346,21 @@ func (s *Server) materializeBucket(bucketName string, replicas int, history uint
 	// mirror bucket, not when creating a source. Without it, mirrors of this
 	// source can't serve direct gets, which is the whole point of mirrors-
 	// everywhere. Update the source stream config to enable it.
+	//
+	// Also where we flip AllowMsgTTL on the source stream — KeyValueConfig
+	// doesn't expose the field, so we patch it post-create. Idempotent because
+	// UpdateStream is a full-config replace; we set what we want and leave the
+	// rest of the existing config in place.
 	srcStream := "KV_" + bucketName
 	if si, infoErr := s.js.StreamInfo(srcStream); infoErr == nil && si != nil {
-		if !si.Config.MirrorDirect {
+		needsUpdate := !si.Config.MirrorDirect || (allowMsgTTL && !si.Config.AllowMsgTTL)
+		if needsUpdate {
 			patched := si.Config
 			patched.MirrorDirect = true
 			patched.AllowDirect = true
+			if allowMsgTTL {
+				patched.AllowMsgTTL = true
+			}
 			_, _ = s.js.UpdateStream(&patched)
 		}
 		// Force the leader to the engine's preferred region (chosen_regions[0])
@@ -462,7 +482,7 @@ func (s *Server) internalEnsureBucketHandler(w http.ResponseWriter, r *http.Requ
 	}
 
 	mirrors, err := s.materializeBucket(req.Name, req.Replicas, req.History, d, req.WithMirrors,
-		"shared demo bucket; auto-placed from anchor "+req.Anchor)
+		"shared demo bucket; auto-placed from anchor "+req.Anchor, 0, false)
 	if err != nil {
 		writeJSON(w, 500, map[string]any{"error": err.Error()})
 		return
@@ -507,7 +527,7 @@ func (s *Server) EnsureSharedBucket(ctx context.Context, name, anchor string, re
 	if err != nil {
 		return nil, fmt.Errorf("placement: %w", err)
 	}
-	if _, err := s.materializeBucket(name, replicas, 8, d, withMirrors, description); err != nil {
+	if _, err := s.materializeBucket(name, replicas, 8, d, withMirrors, description, 0, false); err != nil {
 		return nil, err
 	}
 	return d, nil

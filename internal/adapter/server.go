@@ -537,10 +537,48 @@ func (s *Server) kvPut(w http.ResponseWriter, r *http.Request, bucket, key strin
 		writeErr(w, err, http.StatusBadRequest)
 		return
 	}
+	// Per-key TTL — `X-TTL-Seconds: 30` or `?ttl=30` on the request expires the
+	// key 30s after this write (requires AllowMsgTTL=true on the bucket; honored
+	// by NATS Server 2.11+). Useful for ephemeral state — presence keys,
+	// distributed locks, lease tokens, idempotency markers — without an
+	// out-of-band sweeper. The CAS headers (If-Match / If-None-Match) compose
+	// with TTL when both are sent; we add the KV-protocol expected-sequence
+	// header alongside the TTL header on the low-level publish.
+	ttlSec := r.Header.Get("X-TTL-Seconds")
+	if ttlSec == "" {
+		ttlSec = r.URL.Query().Get("ttl")
+	}
 	var rev uint64
 	ifMatch := r.Header.Get("If-Match")
 	ifNoneMatch := r.Header.Get("If-None-Match")
-	if ifNoneMatch == "*" {
+	if ttlSec != "" {
+		secs, parseErr := strconv.Atoi(ttlSec)
+		if parseErr != nil || secs <= 0 {
+			http.Error(w, "ttl must be positive integer seconds", http.StatusBadRequest)
+			return
+		}
+		msg := nats.NewMsg(fmt.Sprintf("$KV.%s.%s", bucket, key))
+		msg.Data = body
+		msg.Header.Set(nats.MsgTTLHdr, fmt.Sprintf("%ds", secs))
+		// KV CAS uses Nats-Expected-Last-Subject-Sequence on the underlying
+		// stream — same wire shape kv.Create / kv.Update use internally.
+		switch {
+		case ifNoneMatch == "*":
+			msg.Header.Set(nats.ExpectedLastSubjSeqHdr, "0")
+		case ifMatch != "":
+			if _, perr := strconv.ParseUint(ifMatch, 10, 64); perr != nil {
+				http.Error(w, "If-Match must be numeric revision", http.StatusBadRequest)
+				return
+			}
+			msg.Header.Set(nats.ExpectedLastSubjSeqHdr, ifMatch)
+		}
+		ack, pubErr := s.cfg.JS.PublishMsg(msg)
+		if pubErr != nil {
+			writeErr(w, pubErr, http.StatusPreconditionFailed)
+			return
+		}
+		rev = ack.Sequence
+	} else if ifNoneMatch == "*" {
 		rev, err = kv.Create(key, body)
 	} else if ifMatch != "" {
 		var prev uint64
