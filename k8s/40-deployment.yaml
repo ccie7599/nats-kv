@@ -64,9 +64,11 @@ spec:
             - name: BATCH_BUCKETS
               value: "t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_r1,t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_r3"
             - name: BATCH_MAX
-              value: "128"
+              value: "256"
             - name: BATCH_WINDOW_US
               value: "1000"
+            - name: BATCH_INFLIGHT
+              value: "32"
             - name: LISTEN_ADDR
               value: ":8080"
             - name: JETSTREAM_DIR
