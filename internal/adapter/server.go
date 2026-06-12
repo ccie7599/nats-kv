@@ -31,6 +31,7 @@ type Server struct {
 	mux     *http.ServeMux
 	started time.Time
 	keys    *KeyCache
+	batch   *batcher // nil unless BATCH_BUCKETS set (see batch.go)
 
 	mu             sync.RWMutex
 	localMirrorFor map[string]string // bucket -> KV_<bucket>_mirror_<region> on this node
@@ -42,6 +43,7 @@ func New(cfg Config) *Server {
 		mux:            http.NewServeMux(),
 		started:        time.Now(),
 		keys:           NewKeyCache(cfg.JS, cfg.DemoToken, cfg.ControlURL),
+		batch:          newBatcherFromEnv(cfg.NC, cfg.JS),
 		localMirrorFor: map[string]string{},
 	}
 	s.routes()
@@ -588,6 +590,8 @@ func (s *Server) kvPut(w http.ResponseWriter, r *http.Request, bucket, key strin
 			return
 		}
 		rev, err = kv.Update(key, body, prev)
+	} else if s.batch.enabledFor(bucket) {
+		rev, err = s.batch.put(bucket, key, body)
 	} else {
 		rev, err = kv.Put(key, body)
 	}

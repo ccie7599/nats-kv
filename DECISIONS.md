@@ -458,3 +458,11 @@ Suspected root cause: gossip-advertised peer addresses for the LZ pod were the p
 
 ---
 
+
+## ADR-020 — Atomic batch publish on the hot KV write path (flag-gated)
+
+**Context**: Load testing for the Walmart draw-event POC measured the single-stream write ceiling at ~5.7K writes/s (7KB values) with the adapter doing one synchronous `js.PublishMsg` — one full RAFT round-trip + fsync — per HTTP PUT. CPU stopped buying throughput past ~2 cores (lock contention + per-write consensus). Previous NATS POCs lost to Kafka on exactly this: no write batching. NATS Server 2.12 (ADR-50) added atomic batch publishing; we already embed 2.12.5.
+
+**Decision**: New `internal/adapter/batch.go` coalesces concurrent plain PUTs (no CAS, no TTL — those stay synchronous) per bucket into atomic batches: staged messages carry `Nats-Batch-Id`/`-Sequence` with no reply, the final message adds `Nats-Batch-Commit` and its single PubAck covers the batch. HTTP 200s release only after the commit ack — durability semantics unchanged, one consensus round per batch instead of per write. Per-message revisions are derived from the commit ack (atomic batch = contiguous stream sequences); verified 100/100 against read-back revisions in a 2-node local mesh.
+
+Opt-in per bucket: `BATCH_BUCKETS=<scoped-bucket,...>` (default off for everyone), `BATCH_MAX` (default 128, server cap 1000), `BATCH_WINDOW_US` (default 1000). Target stream needs `allow_atomic: true` (set via `$JS.API.STREAM.UPDATE`; control plane does not set it at create time yet — follow-up if batching graduates from POC).
