@@ -28,6 +28,10 @@ import (
 //   BATCH_BUCKETS    comma-separated bucket names to batch ("" disables)
 //   BATCH_MAX        max messages per batch         (default 128, server cap 1000)
 //   BATCH_WINDOW_US  flush window after first write (default 1000µs)
+//   BATCH_INFLIGHT   concurrent uncommitted batches per bucket (default 8,
+//                    server default cap 50/stream) — overlaps commit-ack RTT
+//                    with assembly of the next batch, which is what makes
+//                    batching pay on quorum (R3) streams
 
 const (
 	batchIdHdr     = "Nats-Batch-Id"
@@ -47,11 +51,12 @@ type batchResult struct {
 }
 
 type batcher struct {
-	nc      *nats.Conn
-	js      nats.JetStreamContext
-	max     int
-	window  time.Duration
-	buckets map[string]bool
+	nc       *nats.Conn
+	js       nats.JetStreamContext
+	max      int
+	window   time.Duration
+	inflight int
+	buckets  map[string]bool
 
 	mu     sync.Mutex
 	queues map[string]chan batchPut // bucket -> queue (one flusher each)
@@ -76,8 +81,12 @@ func newBatcherFromEnv(nc *nats.Conn, js nats.JetStreamContext) *batcher {
 	if v, err := strconv.Atoi(os.Getenv("BATCH_WINDOW_US")); err == nil && v > 0 {
 		window = time.Duration(v) * time.Microsecond
 	}
+	inflight := 8
+	if v, err := strconv.Atoi(os.Getenv("BATCH_INFLIGHT")); err == nil && v > 0 && v <= 50 {
+		inflight = v
+	}
 	return &batcher{
-		nc: nc, js: js, max: max, window: window,
+		nc: nc, js: js, max: max, window: window, inflight: inflight,
 		buckets: buckets,
 		queues:  map[string]chan batchPut{},
 	}
@@ -106,6 +115,10 @@ func (b *batcher) put(bucket, key string, data []byte) (uint64, error) {
 }
 
 func (b *batcher) flushLoop(q chan batchPut) {
+	// Bounded concurrent flushes: the commit-ack RTT of batch N overlaps with
+	// assembly of batch N+1. Cross-batch ordering is not preserved — fine for
+	// the unique-key write-sink; same-key racing is already racy over HTTP.
+	sem := make(chan struct{}, b.inflight)
 	for first := range q {
 		batch := []batchPut{first}
 		timer := time.NewTimer(b.window)
@@ -119,7 +132,11 @@ func (b *batcher) flushLoop(q chan batchPut) {
 			}
 		}
 		timer.Stop()
-		b.flush(batch)
+		sem <- struct{}{}
+		go func(batch []batchPut) {
+			defer func() { <-sem }()
+			b.flush(batch)
+		}(batch)
 	}
 }
 
