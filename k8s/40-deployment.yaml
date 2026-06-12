@@ -49,7 +49,7 @@ spec:
       # Read DEMO_TOKEN from Vault-injected file at startup
       containers:
         - name: adapter
-          image: harbor.harbor.svc.cluster.local/presales/nats-kv-adapter:775f9a5
+          image: harbor.harbor.svc.cluster.local/presales/nats-kv-adapter:87ff2a2
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c"]
           args:
@@ -62,7 +62,7 @@ spec:
               value: "us-ord"
             # ADR-020 — atomic batch publish, opt-in per bucket (walmart POC)
             - name: BATCH_BUCKETS
-              value: "t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_r1"
+              value: "t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_r1,t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_r3"
             - name: BATCH_MAX
               value: "128"
             - name: BATCH_WINDOW_US
