@@ -33,7 +33,7 @@ spec:
         - name: harbor-creds
       containers:
         - name: adapter
-          image: harbor.connected-cloud.io/presales/nats-kv-adapter:v0.1.8
+          image: harbor.connected-cloud.io/presales/nats-kv-adapter:87ff2a2
           imagePullPolicy: IfNotPresent
           env:
             - name: REGION
@@ -60,6 +60,15 @@ spec:
               value: "8222"
             - name: NATS_ROUTES
               value: "nats-route://us-ord.nats-kv.connected-cloud.io:6222"
+            # ADR-020 — atomic batch publish, opt-in per bucket (walmart POC)
+            - name: BATCH_BUCKETS
+              value: "t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_r1,t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_r3,t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_r3_eu"
+            - name: BATCH_MAX
+              value: "256"
+            - name: BATCH_WINDOW_US
+              value: "1000"
+            - name: BATCH_INFLIGHT
+              value: "32"
           ports:
             - { name: http,         containerPort: 8080, hostPort: 8080 }
             - { name: https,        containerPort: 443,  hostPort: 443 }
@@ -75,8 +84,8 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 30
           resources:
-            requests: { cpu: 200m, memory: 256Mi }
-            limits:   { cpu: 1500m, memory: 2Gi }
+            requests: { cpu: "2", memory: 1Gi }
+            limits:   { cpu: "6", memory: 6Gi }   # was 1500m — same CPU throttle found on the LZ node (walmart load test)
           volumeMounts:
             - name: jetstream
               mountPath: /var/lib/nats/jetstream
