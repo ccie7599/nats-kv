@@ -39,6 +39,10 @@ spec:
           {{ .Data.data.admin_token }}
           {{- end -}}
     spec:
+      # Dedicated CPU node — adapter was CPU-throttled at 1.5 cores on the shared
+      # GPU node (see walmart load test, 2026-06-12)
+      nodeSelector:
+        node.kubernetes.io/instance-type: g6-dedicated-8
       serviceAccountName: app-vault-access
       imagePullSecrets:
         - name: harbor-creds
@@ -111,11 +115,11 @@ spec:
             periodSeconds: 30
           resources:
             requests:
-              cpu: 200m
-              memory: 1Gi
+              cpu: "2"
+              memory: 2Gi
             limits:
-              cpu: 1500m
-              memory: 4Gi
+              cpu: "6"
+              memory: 8Gi
           volumeMounts:
             - name: jetstream
               mountPath: /var/lib/nats/jetstream
