@@ -62,7 +62,7 @@ spec:
               value: "nats-route://us-ord.nats-kv.connected-cloud.io:6222"
             # ADR-020 — atomic batch publish, opt-in per bucket (walmart POC)
             - name: BATCH_BUCKETS
-              value: "t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_r1,t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_r3,t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_r3_eu"
+              value: "t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_r3_eu,t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_eu_r1_s0,t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_eu_r1_s1,t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_eu_r1_s2"
             - name: BATCH_MAX
               value: "256"
             - name: BATCH_WINDOW_US
@@ -84,8 +84,8 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 30
           resources:
-            requests: { cpu: "2", memory: 1Gi }
-            limits:   { cpu: "6", memory: 6Gi }   # was 1500m — same CPU throttle found on the LZ node (walmart load test)
+            requests: { cpu: "4", memory: 4Gi }
+            limits:   { cpu: "14", memory: 16Gi }   # 16-core EU nodes; 14-core limit to host multiple shard streams per node (walmart load test)
           volumeMounts:
             - name: jetstream
               mountPath: /var/lib/nats/jetstream
