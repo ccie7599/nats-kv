@@ -39,10 +39,11 @@ spec:
           {{ .Data.data.admin_token }}
           {{- end -}}
     spec:
-      # Dedicated CPU node — adapter was CPU-throttled at 1.5 cores on the shared
-      # GPU node (see walmart load test, 2026-06-12)
+      # Dedicated CPU node. Single-stream is serial-bound (~5.6K w/s, 5.3 cores);
+      # 16-core node + 14-core limit is to host MULTIPLE shard streams per node —
+      # per-node aggregate is the CPU-bound axis (walmart load test, 2026-06-13).
       nodeSelector:
-        node.kubernetes.io/instance-type: g6-dedicated-8
+        node.kubernetes.io/instance-type: g6-dedicated-16
       serviceAccountName: app-vault-access
       imagePullSecrets:
         - name: harbor-creds
@@ -62,7 +63,7 @@ spec:
               value: "us-ord"
             # ADR-020 — atomic batch publish, opt-in per bucket (walmart POC)
             - name: BATCH_BUCKETS
-              value: "t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_r1,t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_r3"
+              value: "t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_r1,t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_r3,t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_r1_s0,t_0b7f872b89f4f3a0a6dd552ab1908a51__walmart_r1_s1"
             - name: BATCH_MAX
               value: "256"
             - name: BATCH_WINDOW_US
@@ -124,11 +125,11 @@ spec:
             periodSeconds: 30
           resources:
             requests:
-              cpu: "2"
-              memory: 2Gi
+              cpu: "4"
+              memory: 4Gi
             limits:
-              cpu: "6"
-              memory: 8Gi
+              cpu: "14"
+              memory: 16Gi
           volumeMounts:
             - name: jetstream
               mountPath: /var/lib/nats/jetstream
